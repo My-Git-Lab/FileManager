@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' file:; media-src 'self' file:">
+  <title>本地文件管理器</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- 页面不再有顶部工具栏：仅保留左（工作区）/ 中（阅览区）/ 右（详情区）三栏 -->
+  <div id="main-row">
+
+    <!-- 左：工作区 -->
+    <aside id="left-panel">
+      <div id="lp-body">
+
+        <!-- 当前文库卡片 -->
+        <section class="lp-sec">
+          <div class="lp-sec-title">当前文库</div>
+          <div class="lib-card">
+            <div class="lc-top">
+              <span class="lc-icon">📚</span>
+              <span class="lc-name" id="lib-card-name">未选择文库</span>
+              <span class="lc-state" id="lib-card-state">—</span>
+            </div>
+            <div class="lc-path" id="lib-card-path" title="">尚未创建或选择文库</div>
+            <div class="lc-stats">
+              <div class="lc-stat"><b id="lc-stat-cat">–</b><i>大类</i></div>
+              <div class="lc-stat"><b id="lc-stat-group">–</b><i>文件组</i></div>
+              <div class="lc-stat"><b id="lc-stat-size">–</b><i>总大小</i></div>
+            </div>
+          </div>
+          <div class="lp-btn-row">
+            <button id="btn-lib-switch" title="在已登记的文库之间切换">切换</button>
+            <button id="btn-lib-new" title="新建一个文库">新建</button>
+            <button id="btn-lib-migrate" title="把文库整体搬到别的位置">迁移</button>
+          </div>
+        </section>
+
+        <!-- 检索 -->
+        <section class="lp-sec">
+          <div class="lp-sec-title">
+            <span>检索当前文库</span>
+            <button id="btn-search-mode" title="点击切换检索方式">按标签</button>
+          </div>
+          <div class="search-row">
+            <input id="search-input" type="text" placeholder="搜索文件名…" spellcheck="false">
+            <button id="btn-search" title="搜索">搜索</button>
+          </div>
+          <div id="cat-chips"></div>
+          <div id="lib-tag-chips" class="tag-chips hidden"></div>
+        </section>
+
+        <!-- 快捷操作 -->
+        <section class="lp-sec">
+          <div class="lp-sec-title">快捷操作</div>
+          <div class="lp-btn-row">
+            <button id="btn-new-group" class="primary-btn">新建组</button>
+            <button id="btn-add-to-group">添加文件</button>
+          </div>
+          <div class="lp-btn-row">
+            <button id="btn-rescan" title="重新扫描当前文库">重新扫描</button>
+            <button id="btn-open-lib-root" title="在系统文件管理器中打开文库目录">打开目录</button>
+          </div>
+        </section>
+
+        <!-- 文库目录树 -->
+        <section class="lp-sec">
+          <div class="lp-sec-title">文库目录</div>
+          <div id="lib-tree"></div>
+        </section>
+      </div>
+
+      <!-- 历史记录 -->
+      <div id="history-box">
+        <div class="box-title">
+          <span>历史记录</span>
+          <span class="title-btns">
+            <button id="btn-toggle-history" title="隐藏 / 展开历史记录">隐藏</button>
+            <button id="btn-clear-history" title="清空历史记录">清空</button>
+          </span>
+        </div>
+        <div id="history-list"></div>
+      </div>
+    </aside>
+
+    <div class="v-splitter" id="split-left" title="拖动调整宽度"></div>
+
+    <!-- 中：阅览区 -->
+    <main id="preview-panel">
+      <div id="preview-header">
+        <div id="crumb-wrap">
+          <div id="breadcrumb"></div>
+          <span id="preview-name"></span>
+        </div>
+        <span id="preview-actions">
+          <button id="btn-new-lib-inline" class="hidden" title="新建一个文库">新建文库</button>
+          <button id="btn-nav-back" title="回到上一步">后退</button>
+          <button id="btn-nav-forward" title="前往下一步">前进</button>
+          <button id="btn-fullscreen" title="全屏预览">全屏</button>
+          <button id="btn-open-external" class="hidden" title="用系统默认程序打开">打开</button>
+        </span>
+      </div>
+      <div id="preview-body">
+        <div id="preview-empty">
+          <div class="empty-icon">📚</div>
+          <div>正在加载文库…</div>
+          <div class="empty-sub">支持图片 / 视频 / 音频 / 文本直接预览</div>
+        </div>
+      </div>
+    </main>
+
+    <div class="v-splitter" id="split-right" title="拖动调整宽度"></div>
+
+    <!-- 右：详情区 -->
+    <aside id="detail-panel">
+      <div class="box-title">详细信息</div>
+      <div id="detail-body">
+        <div class="hint">未选择文件</div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- 右键菜单 -->
+  <div id="context-menu" class="hidden"></div>
+
+  <!-- 通用对话框 -->
+  <div id="modal-mask" class="hidden">
+    <div id="modal">
+      <div id="modal-title"></div>
+      <div id="modal-body"></div>
+      <div id="modal-buttons">
+        <button id="modal-cancel">取消</button>
+        <button id="modal-ok">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="hidden"></div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

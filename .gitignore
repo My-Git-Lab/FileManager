@@ -1,0 +1,25 @@
+# 忽略依赖目录（体积大，用 npm install 还原）
+node_modules/
+
+# 打包产物
+release/
+dist/
+build/
+
+# 日志
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 调试临时文件
+_dbg*.txt
+_run*.txt
+
+# 示例文库（含本地数据，不随程序一起提交）
+文件库/

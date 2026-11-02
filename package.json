@@ -1,0 +1,57 @@
+{
+  "name": "local-file-manager",
+  "version": "0.1.0",
+  "description": "本地文件管理器 - 浏览、搜索、整理归档（Electron 跨平台）",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux",
+    "dist:mac": "electron-builder --mac",
+    "dist:all": "electron-builder -mwl"
+  },
+  "build": {
+    "appId": "com.local.filemanager",
+    "productName": "LocalFileManager",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "styles.css",
+      "renderer.js",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Utility"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ]
+    }
+  },
+  "devDependencies": {
+    "electron": "^45.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "license": "MIT"
+}

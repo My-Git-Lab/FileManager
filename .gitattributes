@@ -1,0 +1,16 @@
+# 其余文本文件按各系统默认处理（先写通用规则）
+* text=auto
+
+# Windows 批处理文件：完全禁止换行转换，必须原样存 CRLF。
+# 关键：git 的 eol=crlf 只管"检出"，提交时仍会归一化成 LF；
+# 只有 -text（不转换）才能保证仓库里、检出后都是 CRLF。
+# 另外：gitattributes 是"后写的覆盖先写的"，所以这条必须放在 * text=auto 之后。
+# LF 换行的 .bat 会让 cmd.exe 解析错乱（把中文 echo 行拆成碎片当命令执行）。
+*.bat -text
+
+# 二进制文件，不要做任何换行转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.dll binary
