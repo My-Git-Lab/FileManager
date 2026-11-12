@@ -578,6 +578,7 @@ function showPreview(e) {
       if (r.tooLarge) { box.textContent = `文件过大（${fmtSize(r.size)}），文本预览仅支持 2MB 以内。`; renderOpenBtn(); return; }
       if (r.binary) { box.textContent = '该文件是二进制格式，无法以文本预览。'; renderOpenBtn(); return; }
       box.textContent = r.content;
+      if (r.encoding && r.encoding !== 'UTF-8') toast(`该文件为 ${r.encoding} 编码，已自动转换显示`);
     });
   } else if (cat === '文档') {
     setPlaceholder('📄', `${e.name}<br><span style="font-size:12px">Office / PDF 文档暂不支持内嵌预览</span>`);

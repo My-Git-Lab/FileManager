@@ -566,14 +566,33 @@ ipcMain.handle('dialog:pickFiles', async (e) => {
 ipcMain.handle('app:version', () => app.getVersion());
 
 // ---------- IPC: 读取文本文件（预览用，限 2MB，二进制拒绝） ----------
+// 编码识别：UTF-16 必须按 BOM 先识别（它天然含大量 0x00，否则会被误判成二进制）；
+// 无 BOM 时先按 UTF-8 严格校验，失败退回 GB18030（GBK 超集）——
+// 中文 Windows 上大量 .txt 是 GBK，写死 UTF-8 会得到满屏  替换符。
+function decodeText(buf) {
+  if (buf.length >= 2 && buf[0] === 0xFF && buf[1] === 0xFE)
+    return { content: new TextDecoder('utf-16le').decode(buf.subarray(2)), encoding: 'UTF-16 LE' };
+  if (buf.length >= 2 && buf[0] === 0xFE && buf[1] === 0xFF)
+    return { content: new TextDecoder('utf-16be').decode(buf.subarray(2)), encoding: 'UTF-16 BE' };
+  if (buf.includes(0)) return { binary: true };
+  if (buf.length >= 3 && buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF)
+    return { content: new TextDecoder('utf-8').decode(buf.subarray(3)), encoding: 'UTF-8' };
+  try {
+    return { content: new TextDecoder('utf-8', { fatal: true }).decode(buf), encoding: 'UTF-8' };
+  } catch {
+    return { content: new TextDecoder('gb18030').decode(buf), encoding: 'GBK' };
+  }
+}
+
 ipcMain.handle('fs:readText', async (e, filePath) => {
   if (!isAllowed(filePath)) return { error: '无权访问该文件' };
   try {
     const st = await fs.stat(filePath);
     if (st.size > 2 * 1024 * 1024) return { tooLarge: true, size: st.size };
     const buf = await fs.readFile(filePath);
-    if (buf.includes(0)) return { binary: true };
-    return { content: buf.toString('utf-8') };
+    const r = decodeText(buf);
+    if (r.binary) return { binary: true };
+    return { content: r.content, encoding: r.encoding };
   } catch (err) { return { error: err.message }; }
 });
 
