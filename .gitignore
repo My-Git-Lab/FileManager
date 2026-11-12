@@ -17,9 +17,11 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
-# 调试临时文件
+# 调试 / 提交临时文件
 _dbg*.txt
 _run*.txt
+_t*.txt
+_commit_msg.txt
 
 # 示例文库（含本地数据，不随程序一起提交）
 文件库/

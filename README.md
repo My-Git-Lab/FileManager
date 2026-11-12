@@ -1,8 +1,10 @@
 # 本地文件管理器
 
-基于 Electron 的**本地文件管理器**，跨平台，纯本地运行，不联网、不上传任何数据。
+基于 Electron 的**本地文件管理器**，跨平台，纯本地运行，**不上传任何文件**。
 
-当前版本 **v0.2.0**。
+> 网络说明：程序运行时不访问网络、不上传任何文件内容；但**首次运行 `start.bat` 需要联网**下载 Electron 运行包（约 100MB，走 npmmirror 镜像），打包安装包时还需下载 electron-builder 的二进制。依赖装好后日常使用完全离线。
+
+当前版本 **v0.2.1**。
 
 > 本文按版本分段：**v0.1.0 一节是基础说明**（功能、运行、结构、平台差异），之后的每一节**只记录该版本相对上一版的改动**，不复述基础内容。发新版本时按 v0.2.0 的格式在末尾追加即可。
 
@@ -22,7 +24,7 @@
 - **导航**：面包屑、前进/后退、历史记录（可折叠、可清空）
 - **详情与操作**：文件详情（大小、时间、类型等）；右键菜单重命名、迁移、删除（**移入系统回收站**）
 - **兜底**：系统文件对话框不可用或被取消时，自动改用内置文件/文件夹选择器
-- **安全**：`contextIsolation: true` + `nodeIntegration: false` + preload 白名单桥接；主进程限制可访问范围（用户目录 + 本机存在的各盘符根目录）；删除不直接销毁文件
+- **安全**：`contextIsolation: true` + `nodeIntegration: false` + 渲染进程沙箱 + preload 白名单桥接；CSP 与窗口导航管控；主进程按真实路径（realpath）限制可访问范围，屏蔽系统目录与凭据目录；打开可执行文件需确认；删除不直接销毁文件。详见 v0.2.1 一节
 
 > 补充：主进程还保留了一批早期遗留的底层文件操作接口（递归搜索、一键归类、批量重命名、复制/移动等），当前界面没有入口，它们属于保留能力而不是已上线的界面功能。
 
@@ -122,6 +124,36 @@ npm start
 - 「新建组」逻辑抽成共用函数供批量添加复用
 
 > 上述改动均为本地工作区修改，尚未提交 / 推送；底层文件操作能力未删除。
+
+---
+
+## v0.2.1（安全与隐私加固）
+
+相对 v0.2.0 的改动，全部是安全 / 隐私 / 健壮性修复，无新增功能。
+
+**运行防护**
+
+- **移除 `--no-sandbox`**：`start.bat` 之前带这个参数，等于关掉了 Electron 的渲染进程沙箱。实测去掉后程序照常启动，现已恢复默认沙箱；`webPreferences` 显式声明 `sandbox: true` / `webSecurity: true`
+- **窗口锁死在本地页面**：`createWindow()` 新增 `will-navigate`（只放行本应用 `index.html`）、`setWindowOpenHandler`（一律拒绝新窗口）、`setPermissionRequestHandler` / `setPermissionCheckHandler`（拒绝摄像头、麦克风、定位等全部权限）
+- **CSP 收紧**：补 `object-src 'none'`、`base-uri 'none'`、`form-action 'none'`、`frame-src 'none'`、`connect-src 'none'`
+- **打开可执行文件需确认**：`fs:open` 遇到 `.exe` / `.msi` / `.bat` / `.ps1` / `.lnk` 等扩展名会先弹确认框，避免渲染层被注入后静默拉起任意程序
+- **路径白名单加固**：`isAllowed()` 改用 `realpath` 解析真实路径（堵住符号链接 / Windows junction 绕过），并屏蔽系统目录、浏览器凭据库、`~/.ssh` 等敏感位置。可选 `FM_STRICT_ROOTS=1` 开启严格模式，只放行用户主目录、程序目录与已登记文库；额外目录可用 `FM_WRITE_ROOTS` 追加（用 `path.delimiter` 分隔）。若确需管理被屏蔽的系统 / 凭据目录，启动时设 `FM_ALLOW_SENSITIVE=1` 可自行放开（环境变量只能由启动进程设置，渲染层无法修改）
+
+**注入与隐私**
+
+- **标签颜色白名单**：`.library-index.json` 里的 `tags[].color` 曾被原样插进 HTML `style` 属性，恶意账本可注入 `<a href>` 等标签。现在主进程落盘与渲染层双重过滤，只接受 `#RGB` / `#RGBA` / `#RRGGBB` / `#RRGGBBAA`
+- **`escapeHtml()` 补单引号转义**（`'` → `&#39;`），堵住单引号属性插值这个易碎点
+- **账本不再存绝对路径**：`.library-index.json` 落盘时只写相对路径（统一 `/`，标记 `pathVersion: 2`，不再写 `root`），读取时按当前文库位置还原。文库文件夹被打包分享 / 放进网盘时，不会泄露本机用户名与完整目录结构；旧版账本（含 Linux 绝对路径）自动迁移，账本里埋 `../` 试图指向文库外会被拒绝
+- **文库预览图路径修正**：`<img src>` 统一走 `fileUrl()`，此前两处直接塞绝对路径导致封面显示不出来
+
+**健壮性**
+
+- `fs:trash` 兜底不再把文件静默挪到 `~/.Trash-filemanager` 后仍报告「已移入回收站」：改为明确回报实际去向，跨盘改用复制 + 删除
+- `fs:transfer` / `lib:migrate` / `lib:move` 跨盘移动时，删源前先校验副本的文件数与字节数一致，不一致就保留源文件并报错
+- `lib:rename` 补上 `nameError()`（Windows 非法字符、结尾空格 / 句点、保留设备名）
+- `fs:detail` 在 Windows 上不再无条件读取 `/etc/passwd`、`/etc/group`
+
+> 说明：`%APPDATA%/local-file-manager/libraries.json` 与 localStorage 仍存本机绝对路径，它们是本机运行配置、不随文库文件夹分享，故未改动。
 
 ---
 

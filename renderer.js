@@ -58,7 +58,15 @@ function fmtDate(ms) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 function escapeHtml(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+// 颜色白名单：主进程落盘时已过滤一遍，这里再兜一层（账本可能由旧版本写出）。
+// 非法值一律按标签名重新分配，绝不让账本里的字符串直接进 style 属性。
+function safeTagColor(c, name) {
+  const s = String(c == null ? '' : c).trim();
+  const hex = s.startsWith('#') ? s.slice(1) : '';
+  return /^[0-9a-fA-F]+$/.test(hex) && [3, 4, 6, 8].includes(hex.length) ? s : metaTagColor(name);
 }
 // ---------- 层级元数据：作者 / 标签 / 来源 ----------
 // 账本只存每一级「自己填的值」；显示时把文库 → 大类 → 组 → 文件这条链上的
@@ -100,7 +108,7 @@ function effectiveMeta(rel) {
       if (v && !sources.some(x => x.value === v)) sources.push({ value: v, from });
     for (const x of (m.tags || [])) {
       const name = typeof x === 'string' ? x : x.name;
-      const color = (typeof x === 'string' ? '' : x.color) || metaTagColor(name);
+      const color = safeTagColor(typeof x === 'string' ? '' : x.color, name);
       if (name && !tags.has(name)) tags.set(name, { name, color, from });
     }
   });
@@ -117,7 +125,7 @@ function metaListHTML(list, level) {
 function metaTagsHTML(tags, level) {
   if (!tags.length) return '<span class="meta-empty">空</span>';
   return `<span class="detail-tags">${tags.map(x =>
-    `<span class="tag-chip mini" style="--tag-c:${escapeHtml(x.color)}" title="来自${escapeHtml(x.from)}">${escapeHtml(x.name)}${x.from === level ? '' : `<i class="meta-from">${escapeHtml(x.from)}</i>`}</span>`
+    `<span class="tag-chip mini" style="--tag-c:${safeTagColor(x.color, x.name)}" title="来自${escapeHtml(x.from)}">${escapeHtml(x.name)}${x.from === level ? '' : `<i class="meta-from">${escapeHtml(x.from)}</i>`}</span>`
   ).join('')}</span>`;
 }
 function metaRowsHTML(authors, tags, sources, level) {
@@ -148,7 +156,7 @@ function ownMetaBlockHTML(own, level) {
   const mk = arr => (arr || []).map(v => ({ value: v, from: level }));
   const tags = (own.tags || []).map(x => {
     const n = typeof x === 'string' ? x : x.name;
-    return { name: n, color: (typeof x === 'string' ? '' : x.color) || metaTagColor(n), from: level };
+    return { name: n, color: safeTagColor(typeof x === 'string' ? '' : x.color, n), from: level };
   });
   return `<div class="box-title" style="padding:10px 0 4px">维护信息</div>
     ${metaRowsHTML(mk(own.author), tags, mk(own.source), level)}`;
@@ -353,6 +361,7 @@ async function openEntry(e) {
   if (e.isDir) { toast('请在文库树中浏览文件夹'); return; }
   const r = await window.api.open(e.path);
   if (r && r.error) { toast(r.error, true); return; }
+  if (r && r.canceled) return;                 // 用户取消了可执行文件确认框
   addOpenHistory(e);
 }
 
@@ -1039,7 +1048,15 @@ async function opDelete(t) {
     内容会被移入<b>系统回收站</b>，需要时可以还原。</div>`, async () => {
     const r = await window.api.trash([t.path]);
     if (r.failed && r.failed.length) { toast('删除失败：' + r.failed[0].reason, true); return; }
-    toast('已删除，可在回收站还原');
+    if (r.backups && r.backups.length) {
+      // 系统回收站不可用时主进程会把文件挪到备份区并回报真实落点，
+      // 这里必须明确告知，不能再说「已移入回收站」。
+      showModal('已移到备份区', `<div class="hint">系统回收站不可用，文件<b>没有被销毁</b>，已移到：<br><br>
+        <code>${escapeHtml(r.backups[0].backup)}</code><br><br>需要时可从这个位置手动还原。</div>`,
+        () => {}, '知道了', null, { noFocus: true });
+    } else {
+      toast('已删除，可在回收站还原');
+    }
     await refreshAfterOp(t);
   }, '删除');
 }
@@ -1365,7 +1382,7 @@ function showLibraryHome() {
   const tiles = slice.map((c, i) => {
     const covers = c.groups.map(g => g.cover).filter(Boolean).slice(0, 4);
     const cells = [0, 1, 2, 3].map(k => covers[k]
-      ? `<img src="${escapeHtml(covers[k])}" alt="">`
+      ? `<img src="${escapeHtml(fileUrl(covers[k]))}" alt="">`
       : `<div class="m-cell">${k === 0 ? '📚' : ''}</div>`).join('');
     return `
     <div class="tile cat-tile${selClass(c.path)}" data-i="${i}"${cardDataAttr('cat', c.path, c.name)}>
@@ -1421,7 +1438,7 @@ function allTags() {
   const mm = state.libData && state.libData.meta ? state.libData.meta : {};
   for (const m of Object.values(mm))
     for (const x of (m.tags || []))
-      if (x && x.name && !map.has(x.name)) map.set(x.name, x.color || metaTagColor(x.name));
+      if (x && x.name && !map.has(x.name)) map.set(x.name, safeTagColor(x.color, x.name));
   return map;
 }
 function renderTagLevels() {
@@ -1449,7 +1466,7 @@ function renderTagChips() {
   if (!tags.size) { box.innerHTML = ''; return; }
   let html = `<span class="tag-chip${!state.libTagFilter ? ' active' : ''}" data-tag="">全部</span>`;
   for (const [name, color] of tags)
-    html += `<span class="tag-chip${state.libTagFilter === name ? ' active' : ''}" data-tag="${escapeHtml(name)}" style="--tag-c:${color}">${escapeHtml(name)}</span>`;
+    html += `<span class="tag-chip${state.libTagFilter === name ? ' active' : ''}" data-tag="${escapeHtml(name)}" style="--tag-c:${safeTagColor(color, name)}">${escapeHtml(name)}</span>`;
   box.innerHTML = html;
   box.querySelectorAll('.tag-chip').forEach(ch => ch.onclick = () => {
     state.libTagFilter = ch.dataset.tag || null;
@@ -1519,7 +1536,7 @@ function renderLibTree() {
       for (const g of shown) {
         const row = document.createElement('div');
         row.className = 'group-row' + (state.libSel?.type === 'group' && state.libSel.data.path === g.path ? ' selected' : '');
-        const dots = (g.tags || []).map(t => `<i class="tag-dot" style="background:${t.color}" title="${escapeHtml(t.name)}"></i>`).join('');
+        const dots = (g.tags || []).map(t => `<i class="tag-dot" style="background:${safeTagColor(t.color, t.name)}" title="${escapeHtml(t.name)}"></i>`).join('');
         row.innerHTML = `<span class="g-seq">${g.seq != null ? String(g.seq).padStart(4, '0') : '—'}</span>
           <span class="g-name" title="${escapeHtml(g.path)}">${escapeHtml(g.displayName)}</span>
           <span class="g-dotwrap">${dots}</span>
@@ -1546,8 +1563,8 @@ function showCategoryView(cat) {
   const tiles = slice.map((g, i) => `
     <div class="tile g-tile${selClass(g.path)}" data-i="${i}"${cardDataAttr('group', g.path, g.displayName)}>
       <div class="t-slot">
-        ${g.cover ? `<img src="${escapeHtml(g.cover)}" alt="">` : '<span class="cover-fallback">📚</span>'}
-        ${(g.tags && g.tags.length) ? `<div class="t-tags">${g.tags.map(t => `<i style="background:${t.color}" title="${escapeHtml(t.name)}"></i>`).join('')}</div>` : ''}
+        ${g.cover ? `<img src="${escapeHtml(fileUrl(g.cover))}" alt="">` : '<span class="cover-fallback">📚</span>'}
+        ${(g.tags && g.tags.length) ? `<div class="t-tags">${g.tags.map(t => `<i style="background:${safeTagColor(t.color, t.name)}" title="${escapeHtml(t.name)}"></i>`).join('')}</div>` : ''}
       </div>
       <div class="t-foot">
         <div class="t-name" title="${escapeHtml(g.displayName)}">${escapeHtml(g.displayName)}</div>

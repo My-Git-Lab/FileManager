@@ -88,17 +88,100 @@ function buildAllowedRoots() {
   return roots;
 }
 const ALLOWED_ROOTS = buildAllowedRoots();
+
+// ---------- 敏感目录：读写一律拒绝 ----------
+// 文件管理器需要能浏览全盘，但系统目录、浏览器凭据库、SSH 私钥这些地方
+// 不该被一个「渲染本地不可信内容」的进程碰到。阻止正常用户操作之外，
+// 更重要的是堵住渲染层万一被注入后的横向读取（fs:readText 可读任意文本）。
+function buildDenyRoots() {
+  const roots = [];
+  const add = (p) => { if (p) { try { roots.push(path.resolve(p)); } catch {} } };
+  if (process.platform === 'win32') {
+    add(process.env.windir || 'C:\\Windows');
+    add(process.env.ProgramFiles);
+    add(process.env['ProgramFiles(x86)']);
+    add(process.env.ProgramData);
+    for (let code = 67; code <= 90; code++) {
+      const drive = String.fromCharCode(code) + ':\\';
+      try {
+        if (!fss.existsSync(drive)) continue;
+        add(path.join(drive, '$Recycle.Bin'));
+        add(path.join(drive, 'System Volume Information'));
+      } catch {}
+    }
+    const local = process.env.LOCALAPPDATA, roaming = process.env.APPDATA;
+    if (local) for (const p of ['Google/Chrome/User Data',
+                                'Microsoft/Edge/User Data',
+                                'BraveSoftware/Brave-Browser/User Data'])
+      add(path.join(local, ...p.split('/')));
+    if (roaming) add(path.join(roaming, 'Mozilla/Firefox/Profiles'));
+  } else {
+    for (const p of ['/etc', '/proc', '/sys', '/dev', '/boot', '/root', '/run',
+                     '/var/lib', '/usr', '/bin', '/sbin', '/lib', '/lib64']) add(p);
+    if (process.platform === 'darwin')
+      for (const p of ['/System', '/Library', '/private']) add(p);
+  }
+  for (const p of ['.ssh', '.aws', '.gnupg', '.kube', '.config/gcloud'])
+    add(path.join(os.homedir(), ...p.split('/')));
+  return roots;
+}
+const DENY_ROOTS = buildDenyRoots();
 console.log('[安全] 允许访问的根目录：' + ALLOWED_ROOTS.join(' , '));
+console.log('[安全] 敏感目录已屏蔽：' + DENY_ROOTS.length + ' 个（系统目录 / 浏览器凭据 / 密钥）'
+  + (process.env.FM_STRICT_ROOTS === '1' ? '；严格模式已开启' : ''));
+
+// 把路径解析成「真实路径」：逐级向上找到第一个存在的祖先，用 realpath 解析
+// 符号链接 / Windows junction，再把尚不存在的尾部拼回去。
+// 不用 realpath 的话，一个指向别处的 junction 就能绕过纯词法的前缀判断。
+function canonicalPath(p) {
+  let target;
+  try { target = path.resolve(p); } catch { return null; }
+  const tail = [];
+  let cur = target;
+  for (let i = 0; i < 64; i++) {
+    try {
+      fss.lstatSync(cur);
+      let real = cur;
+      try { real = fss.realpathSync.native(cur); }
+      catch { try { real = fss.realpathSync(cur); } catch {} }
+      return tail.length ? path.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return target;
+      tail.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+  return target;
+}
+function withinRoot(root, p) {
+  const r = path.resolve(root);
+  const sep = r.endsWith(path.sep) ? r : r + path.sep;
+  if (process.platform === 'win32')
+    return p.toLowerCase() === r.toLowerCase() || p.toLowerCase().startsWith(sep.toLowerCase());
+  return p === r || p.startsWith(sep);
+}
+// 可选严格模式：FM_STRICT_ROOTS=1 时，只放行用户主目录、程序自身目录、
+// 已登记文库根目录，以及 FM_WRITE_ROOTS 里显式追加的目录（用 path.delimiter 分隔）。
+// 默认关闭 —— 全盘浏览是文件管理器的基本功能，敏感区已由 DENY_ROOTS 兜住。
+// 不缓存：新建 / 删除文库后必须立刻生效，否则会出现「刚建的文库暂时无权访问」。
+// 严格模式是可选功能，每次读一次几 KB 的注册表开销可忽略。
+function strictAllowedRoots() {
+  const roots = [path.resolve(os.homedir()), path.resolve(app.getAppPath())];
+  try { for (const l of (readRegistry().libraries || [])) roots.push(path.resolve(l.path)); } catch {}
+  for (const r of String(process.env.FM_WRITE_ROOTS || '').split(path.delimiter).filter(Boolean))
+    roots.push(path.resolve(r));
+  return roots;
+}
 
 function isAllowed(p) {
-  let resolved;
-  try { resolved = path.resolve(p); } catch { return false; }
-  if (!resolved) return false;
-  return ALLOWED_ROOTS.some(r => {
-    const root = path.resolve(r);
-    const withSep = root.endsWith(path.sep) ? root : root + path.sep;
-    return resolved === root || resolved.startsWith(withSep);
-  });
+  const real = canonicalPath(p);
+  if (!real) return false;
+  // 默认屏蔽敏感目录；确需管理这些位置时可用 FM_ALLOW_SENSITIVE=1 自行放开。
+  // 环境变量只能由启动进程设置，渲染层改不了，所以不会变成注入绕过口。
+  if (process.env.FM_ALLOW_SENSITIVE !== '1' && DENY_ROOTS.some(r => withinRoot(r, real))) return false;
+  const roots = process.env.FM_STRICT_ROOTS === '1' ? strictAllowedRoots() : ALLOWED_ROOTS;
+  return roots.some(r => withinRoot(r, real));
 }
 
 // ---------- 名称合法性校验（Windows 文件名限制比 Linux 严得多） ----------
@@ -251,8 +334,7 @@ ipcMain.handle('fs:transfer', async (e, { mode, sources, destDir }) => {
         } catch (err) {
           // 跨磁盘/跨分区移动（Windows 上 D: <-> C: 很常见）rename 会报 EXDEV
           if (err.code !== 'EXDEV') throw err;
-          await copyDeep(src, dest);
-          await fs.rm(src, { recursive: true, force: true });
+          await moveAcrossDevices(src, dest);
         }
       }
       results.done.push(src);
@@ -271,40 +353,82 @@ async function copyDeep(src, dest) {
     await fs.copyFile(src, dest);
   }
 }
+// 跨盘移动实际是「复制 + 删源」。复制中途失败（磁盘满、文件被占用、权限）时
+// 直接删源会丢数据，所以删之前先核对两边的文件数 / 目录数 / 总字节数。
+async function copyStats(p) {
+  let files = 0, dirs = 0, bytes = 0;
+  const walk = async (cur) => {
+    const st = await fs.stat(cur);
+    if (st.isDirectory()) {
+      dirs++;
+      for (const n of await fs.readdir(cur)) await walk(path.join(cur, n));
+    } else if (st.isFile()) { files++; bytes += st.size; }
+  };
+  await walk(p);
+  return { files, dirs, bytes };
+}
+async function moveAcrossDevices(src, dest) {
+  await copyDeep(src, dest);
+  let a, b;
+  try { a = await copyStats(src); b = await copyStats(dest); }
+  catch (err) {
+    await fs.rm(dest, { recursive: true, force: true }).catch(() => {});
+    throw new Error('副本校验失败（' + err.message + '），已保留原文件');
+  }
+  if (a.files !== b.files || a.dirs !== b.dirs || a.bytes !== b.bytes) {
+    await fs.rm(dest, { recursive: true, force: true }).catch(() => {});
+    throw new Error(`副本不完整（源 ${a.files} 文件 / ${a.bytes} 字节，副本 ${b.files} 文件 / ${b.bytes} 字节）；已保留原文件并清理副本`);
+  }
+  await fs.rm(src, { recursive: true, force: true });
+}
 
 // ---------- IPC: 删除（移入系统回收站，不直接销毁） ----------
 ipcMain.handle('fs:trash', async (e, { paths }) => {
-  const failed = [];
+  const failed = [], backups = [];
   for (const p of paths) {
     try {
       if (!isAllowed(p)) { failed.push({ path: p, reason: '无权访问该路径' }); continue; }
-      await trashPath(p);
+      const backup = await trashPath(p);
+      if (backup) backups.push({ path: p, backup });
     } catch (err) {
       failed.push({ path: p, reason: err.message });
     }
   }
-  return { failed };
+  return { failed, backups };
 });
-// 最后兜底：移动到用户目录下的备份区，保证删除不会静默失败
-function moveToBackup(p) {
+// 最后兜底：系统回收站接口失败时，把文件移到用户目录下的备份区。
+// 旧实现静默这么做、界面却仍提示「已移入回收站」，用户根本不知道东西去哪了。
+// 现在返回实际落点，由界面明确告知；跨盘 rename 会报 EXDEV，同样先验证副本。
+async function moveToBackup(p) {
   const backup = path.join(os.homedir(), '.Trash-filemanager');
-  fss.mkdirSync(backup, { recursive: true });
-  const dest = path.join(backup, `${Date.now()}_${path.basename(p)}`);
-  fss.renameSync(p, dest);
+  await fs.mkdir(backup, { recursive: true });
+  let dest = path.join(backup, `${Date.now()}_${path.basename(p)}`);
+  let i = 1;
+  while (fss.existsSync(dest)) dest = path.join(backup, `${Date.now()}_${i++}_${path.basename(p)}`);
+  try { await fs.rename(p, dest); }
+  catch (err) {
+    if (err.code !== 'EXDEV') throw err;
+    await moveAcrossDevices(p, dest);
+  }
+  return dest;
 }
-function trashPath(p) {
-  // 跨平台：优先用 Electron 自带的回收站接口（Windows 进回收站，Linux 走 gio）
+// 返回 null = 真的进了系统回收站；返回字符串 = 退到了备份区，该字符串是实际落点
+async function trashPath(p) {
   if (typeof shell.trashItem === 'function') {
-    return shell.trashItem(p).catch(() => {
-      try { moveToBackup(p); } catch (e) { throw new Error('移入回收站失败：' + e.message); }
-    });
+    try { await shell.trashItem(p); return null; }
+    catch (primaryErr) {
+      try { return await moveToBackup(p); }
+      catch (e) {
+        throw new Error('移入回收站失败，备份也失败（' + primaryErr.message + ' / ' + e.message + '）');
+      }
+    }
   }
   // 老版本 Electron 没有该接口时，Linux 上退回 gio
   return new Promise((resolve, reject) => {
-    execFile('gio', ['trash', p], (err) => {
-      if (!err) return resolve();
-      try { moveToBackup(p); } catch (e) { return reject(new Error('移入回收站失败：' + e.message)); }
-      resolve();
+    execFile('gio', ['trash', p], async (err) => {
+      if (!err) return resolve(null);
+      try { resolve(await moveToBackup(p)); }
+      catch (e) { reject(new Error('移入回收站失败，备份也失败：' + e.message)); }
     });
   });
 }
@@ -367,8 +491,30 @@ ipcMain.handle('fs:batchRename', async (e, { dirPath, names, pattern, startNum, 
 });
 
 // ---------- IPC: 打开文件 / 在文件管理器中显示 ----------
+// openPath 对可执行文件等于「在本机运行这段代码」，来自外部文库/下载目录的
+// 文件必须先让用户明确确认一次，避免渲染层被注入后静默拉起任意程序。
+const EXECUTABLE_EXTS = new Set([
+  '.exe', '.msi', '.bat', '.cmd', '.ps1', '.vbs', '.vbe', '.js', '.jse',
+  '.wsf', '.wsh', '.scr', '.com', '.pif', '.jar', '.hta', '.reg', '.lnk',
+  '.app', '.appimage', '.sh', '.desktop'
+]);
 ipcMain.handle('fs:open', async (e, p) => {
   if (!isAllowed(p)) return { error: '无权访问该路径' };
+  if (EXECUTABLE_EXTS.has(path.extname(p).toLowerCase())) {
+    try {
+      const ans = await dialog.showMessageBox(BrowserWindow.fromWebContents(e.sender), {
+        type: 'warning',
+        buttons: ['取消', '仍要打开'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+        title: '即将运行可执行文件',
+        message: `「${path.basename(p)}」是可执行文件，打开它等于在本机运行这段代码。`,
+        detail: '如果这个文件来自别人或网络，请先确认来源可信。'
+      });
+      if (ans.response !== 1) return { canceled: true };
+    } catch (err) { return { error: '无法弹出确认框：' + err.message }; }
+  }
   const r = await shell.openPath(p);
   return r ? { error: r } : { ok: true };
 });
@@ -432,7 +578,10 @@ ipcMain.handle('fs:readText', async (e, filePath) => {
 });
 
 // ---------- IPC: 文件详情（所有者/组/权限/三种时间） ----------
+let _passwdMap = null, _groupMap = null;
 function parsePasswd() {
+  if (process.platform === 'win32') return {};   // Windows 没有 /etc/passwd，也没有 POSIX uid/gid
+  if (_passwdMap) return _passwdMap;
   try {
     const lines = fss.readFileSync('/etc/passwd', 'utf-8').split('\n');
     const map = {};
@@ -440,10 +589,13 @@ function parsePasswd() {
       const parts = line.split(':');
       if (parts.length >= 3) map[parseInt(parts[2])] = parts[0];
     }
+    _passwdMap = map;
     return map;
-  } catch { return {}; }
+  } catch { return (_passwdMap = {}); }
 }
 function parseGroup() {
+  if (process.platform === 'win32') return {};
+  if (_groupMap) return _groupMap;
   try {
     const lines = fss.readFileSync('/etc/group', 'utf-8').split('\n');
     const map = {};
@@ -451,8 +603,9 @@ function parseGroup() {
       const parts = line.split(':');
       if (parts.length >= 3) map[parseInt(parts[2])] = parts[0];
     }
+    _groupMap = map;
     return map;
-  } catch { return {}; }
+  } catch { return (_groupMap = {}); }
 }
 ipcMain.handle('fs:detail', async (e, p) => {
   if (!isAllowed(p)) return { error: '无权访问' };
@@ -508,9 +661,17 @@ function mergeTags(a, b) {
     const name = String(typeof t === 'string' ? t : ((t && t.name) || '')).trim();
     if (!name || seen.has(name)) continue;
     seen.add(name);
-    out.push({ name, color: (t && t.color) || tagColor(name) });
+    out.push({ name, color: safeTagColor(t && t.color, name) });
   }
   return out;
+}
+// 颜色会被渲染层插进 HTML 的 style 属性，而账本可能来自「别人给你的文库文件夹」。
+// 只接受合法的 #RGB / #RGBA / #RRGGBB / #RRGGBBAA，其它一律按标签名重新分配，
+// 避免账本里埋 `red" onmouseover=...` 之类的注入载荷。
+function safeTagColor(c, name) {
+  const s = String(c == null ? '' : c).trim();
+  const hex = s.startsWith('#') ? s.slice(1) : '';
+  return /^[0-9a-fA-F]+$/.test(hex) && [3, 4, 6, 8].includes(hex.length) ? s : tagColor(name);
 }
 function normMeta(raw, rel) {
   const m = emptyMeta();
@@ -575,6 +736,70 @@ function writeRegistry(reg) {
   fss.writeFileSync(REGISTRY_FILE, JSON.stringify(reg, null, 2));
 }
 
+// ---------- 账本路径脱敏：磁盘只存相对路径 ----------
+// .library-index.json 随文库文件夹一起存放。旧版本把每个文件的绝对路径都写了进去，
+// 一旦文库被打包发人、放进网盘或误提交，泄露的是本机用户名、完整目录结构和文件命名。
+// 现在落盘只写相对路径（统一 /）；读进来后按「当前文库根目录」还原成绝对路径，
+// 所以渲染层与所有 IPC 仍按原来的绝对路径工作，无需改动。
+function ledgerToRel(root, p) {
+  if (!p || typeof p !== 'string') return p;
+  if (!path.isAbsolute(p)) return p;                    // 已经相对化
+  return path.relative(root, p).replace(/\\/g, '/');
+}
+function ledgerToAbs(root, p) {
+  if (!p || typeof p !== 'string') return p;
+  if (path.isAbsolute(p)) return p;                    // 旧账本由 hydrateLedger 重定位
+  const base = path.resolve(root);
+  const joined = path.resolve(base, p.replace(/\\/g, '/'));
+  // 账本可能来自外部，禁止 ../ 逃出文库范围去指向别处
+  if (joined !== base && !joined.startsWith(base + path.sep)) return null;
+  return joined;
+}
+function ledgerWalk(led, fn) {
+  for (const c of (led.categories || [])) {
+    fn(c);
+    for (const g of (c.groups || [])) {
+      fn(g);
+      for (const f of (g.files || [])) fn(f);
+    }
+  }
+}
+function dehydrateLedger(led, root) {
+  const out = JSON.parse(JSON.stringify(led));
+  delete out.root;                    // 根目录由「当前文库所在位置」决定，不再落盘
+  out.pathVersion = 2;
+  ledgerWalk(out, (o) => {
+    if (o.path !== undefined) o.path = ledgerToRel(root, o.path);
+    if (o.cover !== undefined) o.cover = ledgerToRel(root, o.cover);
+  });
+  return out;
+}
+function hydrateLedger(led, root) {
+  const out = JSON.parse(JSON.stringify(led));
+  const oldRoot = led.root || root;
+  out.root = root;
+  ledgerWalk(out, (o) => {
+    for (const k of ['path', 'cover']) {
+      const v = o[k];
+      if (!v || typeof v !== 'string') continue;
+      if (path.isAbsolute(v) && !led.pathVersion) {
+        // 旧格式：先按账本自己记的旧根目录算出相对位置，再映射到当前位置。
+        // 从 Linux 搬来的账本在 Windows 上也能对上号，且不会去访问旧机器路径。
+        o[k] = ledgerToAbs(root, path.relative(oldRoot, v).replace(/\\/g, '/'));
+      } else {
+        o[k] = ledgerToAbs(root, v);
+      }
+    }
+  });
+  return out;
+}
+async function readLedger(lp, root) {
+  return hydrateLedger(JSON.parse(await fs.readFile(lp, 'utf8')), root);
+}
+async function writeLedger(lp, led, root) {
+  await fs.writeFile(lp, JSON.stringify(dehydrateLedger(led, root), null, 2));
+}
+
 // 递归收集目录内所有文件
 async function collectFiles(dir, depth = 0) {
   let fileCount = 0, totalSize = 0;
@@ -620,7 +845,7 @@ async function scanLibrary(root) {
     await fs.mkdir(root, { recursive: true });
     const ledgerPath = path.join(root, '.library-index.json');
     let old = null;
-    try { old = JSON.parse(await fs.readFile(ledgerPath, 'utf8')); } catch {}
+    try { old = await readLedger(ledgerPath, root); } catch {}
     const libName = old && old.name ? old.name : null;
     // 预览图按相对路径保留（文库整体迁移后相对路径不变，不会丢）
     const oldCover = {};
@@ -694,7 +919,7 @@ async function scanLibrary(root) {
     };
     // 账本随文库走（隐藏文件，不会被当作大类）
     try {
-      await fs.writeFile(ledgerPath, JSON.stringify(indexData, null, 2));
+      await writeLedger(ledgerPath, indexData, root);
     } catch {}
     return indexData;
   } catch (err) { return { error: err.message }; }
@@ -760,7 +985,7 @@ ipcMain.handle('lib:list', async () => {
     let catCount = 0, groupCount = 0, totalSize = 0, fileCount = 0, updatedAt = null, cover = null, libMeta = null;
     if (exists) {
       try {
-        const d = JSON.parse(await fs.readFile(path.join(lib.path, '.library-index.json'), 'utf8'));
+        const d = await readLedger(path.join(lib.path, '.library-index.json'), lib.path);
         const cats = d.categories || [];
         catCount = cats.length;
         updatedAt = d.updatedAt || null;
@@ -824,15 +1049,13 @@ ipcMain.handle('lib:migrate', async (e, { oldPath, newParent }) => {
       await fs.rename(oldPath, target);
     } catch (err) {
       if (err.code !== 'EXDEV') throw err;
-      // 跨磁盘：复制后删除原位置
-      await copyDeep(oldPath, target);
-      await fs.rm(oldPath, { recursive: true, force: true });
+      await moveAcrossDevices(oldPath, target);   // 跨盘：校验副本后才删源
     }
     // 更新账本里的 root
     try {
-      const ledger = JSON.parse(await fs.readFile(path.join(target, '.library-index.json'), 'utf8'));
-      ledger.root = target;
-      await fs.writeFile(path.join(target, '.library-index.json'), JSON.stringify(ledger, null, 2));
+      const lp = path.join(target, '.library-index.json');
+      const ledger = await readLedger(lp, target);
+      await writeLedger(lp, ledger, target);
     } catch {}
     // 更新注册表
     const reg = readRegistry();
@@ -900,12 +1123,12 @@ ipcMain.handle('lib:addFiles', async (e, { groupPath, files }) => {
 async function updateGroupMeta(root, groupPath, patch) {
   const ledgerPath = path.join(root, '.library-index.json');
   try {
-    const ledger = JSON.parse(await fs.readFile(ledgerPath, 'utf8'));
+    const ledger = await readLedger(ledgerPath, root);
     for (const c of (ledger.categories || [])) {
       const g = (c.groups || []).find(x => x.path === groupPath || path.basename(x.path) === path.basename(groupPath));
       if (g) {
         Object.assign(g, patch);
-        await fs.writeFile(ledgerPath, JSON.stringify(ledger, null, 2));
+        await writeLedger(ledgerPath, ledger, root);
         return { ok: true, group: g };
       }
     }
@@ -917,7 +1140,7 @@ async function updateGroupMeta(root, groupPath, patch) {
 async function writeMeta(root, rel, patch, level) {
   const lp = path.join(root, '.library-index.json');
   let led = {};
-  try { led = JSON.parse(await fs.readFile(lp, 'utf8')); } catch {}
+  try { led = await readLedger(lp, root); } catch {}
   const mm = metaFromLedger(led, root);
   const cur = mm[rel] || emptyMeta();
   const next = emptyMeta();
@@ -928,14 +1151,14 @@ async function writeMeta(root, rel, patch, level) {
   next.tags = patch.tags !== undefined ? mergeTags([], patch.tags) : cur.tags;
   if (next.author.length || next.source.length || next.tags.length) mm[rel] = next;
   else delete mm[rel];
-  await fs.writeFile(lp, JSON.stringify(persistMeta(led, mm), null, 2));
+  await writeLedger(lp, persistMeta(led, mm), root);
   return { ok: true, meta: next };
 }
 // 批量添加用：保留该组已有的作者 / 来源 / 标签，把新一批的值合并进去（去重）
 async function mergeMeta(root, rel, patch, level) {
   const lp = path.join(root, '.library-index.json');
   let led = {};
-  try { led = JSON.parse(await fs.readFile(lp, 'utf8')); } catch {}
+  try { led = await readLedger(lp, root); } catch {}
   const mm = metaFromLedger(led, root);
   const cur = mm[rel] || emptyMeta();
   const next = {
@@ -946,7 +1169,7 @@ async function mergeMeta(root, rel, patch, level) {
   if ((level || levelOfRel(rel)) === 'file') { next.author = []; next.source = []; }
   if (next.author.length || next.source.length || next.tags.length) mm[rel] = next;
   else delete mm[rel];
-  await fs.writeFile(lp, JSON.stringify(persistMeta(led, mm), null, 2));
+  await writeLedger(lp, persistMeta(led, mm), root);
   return next;
 }
 ipcMain.handle('lib:setMeta', async (e, { root, rel, level, patch }) => {
@@ -992,7 +1215,7 @@ async function rewriteMeta(oldPath, newPath, isDir) {
   if (!root) return;
   const srcLedger = path.join(root, '.library-index.json');
   let ledger = {};
-  try { ledger = JSON.parse(await fs.readFile(srcLedger, 'utf8')); } catch { return; }
+  try { ledger = await readLedger(srcLedger, root); } catch { return; }
   const mm = metaFromLedger(ledger, root);
   const oldRel = relKey(root, oldPath);
   const newRel = relKey(newRoot || root, newPath);
@@ -1005,15 +1228,15 @@ async function rewriteMeta(oldPath, newPath, isDir) {
   if (!Object.keys(moved).length) return;
   try {
     if (newRoot && newRoot !== oldRoot) {
-      await fs.writeFile(srcLedger, JSON.stringify(persistMeta(ledger, rest), null, 2));
+      await writeLedger(srcLedger, persistMeta(ledger, rest), root);
       const dstLedger = path.join(newRoot, '.library-index.json');
       let other = {};
-      try { other = JSON.parse(await fs.readFile(dstLedger, 'utf8')); } catch {}
+      try { other = await readLedger(dstLedger, newRoot); } catch {}
       const dstMap = metaFromLedger(other, newRoot);
       for (const [k, v] of Object.entries(moved)) dstMap[k] = v;
-      await fs.writeFile(dstLedger, JSON.stringify(persistMeta(other, dstMap), null, 2));
+      await writeLedger(dstLedger, persistMeta(other, dstMap), newRoot);
     } else {
-      await fs.writeFile(srcLedger, JSON.stringify(persistMeta(ledger, { ...rest, ...moved }), null, 2));
+      await writeLedger(srcLedger, persistMeta(ledger, { ...rest, ...moved }), root);
     }
   } catch (err) { console.log('[批次] 元数据键同步失败：' + err.message); }
 }
@@ -1028,7 +1251,7 @@ ipcMain.handle('lib:locations', async () => {
     if (!exists || !isAllowed(lib.path)) continue;
     const categories = [];
     let ledger = null;
-    try { ledger = JSON.parse(await fs.readFile(path.join(lib.path, '.library-index.json'), 'utf8')); } catch {}
+    try { ledger = await readLedger(path.join(lib.path, '.library-index.json'), lib.path); } catch {}
     if (ledger && Array.isArray(ledger.categories)) {
       for (const c of ledger.categories) {
         const catName = c.name || path.basename(c.path);
@@ -1195,6 +1418,8 @@ ipcMain.handle('lib:rename', async (e, { kind, target, newName }) => {
   if (!isAllowed(target)) return { error: '无权访问该路径' };
   const safe = String(newName || '').trim().replace(/[/\\:*?"<>|]/g, '');
   if (!safe) return { error: '名称不能为空' };
+  const badName = nameError(safe);
+  if (badName) return { error: badName };
   const dir = path.dirname(target);
   const base = path.basename(target);
   let newBase;
@@ -1222,9 +1447,9 @@ ipcMain.handle('lib:rename', async (e, { kind, target, newName }) => {
     if (lib) { lib.path = newPath; lib.name = safe; writeRegistry(reg); }
     try {
       const lp = path.join(newPath, '.library-index.json');
-      const led = JSON.parse(await fs.readFile(lp, 'utf8'));
-      led.root = newPath; led.name = safe;
-      await fs.writeFile(lp, JSON.stringify(led, null, 2));
+      const led = await readLedger(lp, newPath);
+      led.name = safe;
+      await writeLedger(lp, led, newPath);
     } catch {}
   }
   const displayName = kind === 'group' ? parseGroupName(newBase).displayName : safe;
@@ -1247,8 +1472,7 @@ ipcMain.handle('lib:move', async (e, { target, destDir }) => {
       await fs.rename(target, dest);
     } catch (err) {
       if (err.code !== 'EXDEV') throw err;
-      await copyDeep(target, dest);            // 跨磁盘：复制后删除原位置
-      await fs.rm(target, { recursive: true, force: true });
+      await moveAcrossDevices(target, dest);    // 跨盘：校验副本后才删源
     }
     // 迁移后同步账本里的层级元数据键（跨文库时一并搬到目标账本）
     let movedIsDir = false;
@@ -1259,6 +1483,19 @@ ipcMain.handle('lib:move', async (e, { target, destDir }) => {
 });
 
 // ---------- 窗口 ----------
+const APP_PAGE = path.resolve(__dirname, 'index.html');
+// 本程序全部内容都在本地 index.html 一个页面里，不需要任何站外导航。
+// 这条判断只放行「当前这个页面自己」，外部 http(s)、其它 file: 页面一律拒绝。
+function isAppPage(url) {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'file:') return false;
+    let p = decodeURIComponent(u.pathname);
+    if (/^\/[A-Za-z]:[\\/]/.test(p)) p = p.slice(1);   // Windows: /D:/... → D:/...
+    return path.resolve(p) === APP_PAGE;
+  } catch { return false; }
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1240,
@@ -1269,7 +1506,9 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      sandbox: true,                 // 显式开启渲染进程沙箱（Electron 20+ 默认开启）
+      webSecurity: true
     }
   });
   // 程序名与版本号显示在系统窗口标题栏，禁止页面标题覆盖
@@ -1277,6 +1516,26 @@ function createWindow() {
   // 不显示窗口顶部菜单（文件/编辑/查看/窗口）
   win.removeMenu();
   if (typeof win.setMenuBarVisibility === 'function') win.setMenuBarVisibility(false);
+
+  // 渲染层可能因不可信输入（外部账本、恶意文件名）被注入 <a href> 或
+  // window.open，这里是最后一道闸：导航只留本地页面，新窗口一律不开。
+  win.webContents.on('will-navigate', (e, url) => {
+    if (!isAppPage(url)) {
+      e.preventDefault();
+      console.log('[安全] 已拦截页面导航：' + url);
+    }
+  });
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    console.log('[安全] 已拦截新窗口请求：' + url);
+    return { action: 'deny' };
+  });
+  // 本地文件管理器不需要摄像头、麦克风、定位、通知、剪贴板读取等任何权限
+  const ses = win.webContents.session;
+  if (typeof ses.setPermissionRequestHandler === 'function')
+    ses.setPermissionRequestHandler((wc, permission, cb) => cb(false));
+  if (typeof ses.setPermissionCheckHandler === 'function')
+    ses.setPermissionCheckHandler(() => false);
+
   win.loadFile('index.html');
 }
 

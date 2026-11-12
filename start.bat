@@ -68,7 +68,7 @@ if not exist "%ELEXE%" (
 :run
 if not exist "%ELEXE%" goto :fail
 echo [启动中] 正在打开程序...
-call "%ELEXE%" . --no-sandbox
+call "%ELEXE%" .
 if errorlevel 1 goto :fail
 goto :end
 
