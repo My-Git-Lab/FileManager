@@ -310,7 +310,7 @@ function trashPath(p) {
 }
 
 // ---------- IPC: 一键归类 ----------
-ipcMain.handle('fs:organize', async (e, { dirPath }) => {
+ipcMain.handle('fs:organize', async (e, dirPath) => {
   if (!isAllowed(dirPath)) return { error: '无权访问该目录' };
   const summary = {};
   let names;
@@ -465,9 +465,10 @@ ipcMain.handle('fs:detail', async (e, p) => {
       birthtime: st.birthtimeMs,
       mtime: st.mtimeMs,
       atime: st.atimeMs,
-      owner: parsePasswd()[st.uid] || String(st.uid),
-      group: parseGroup()[st.gid] || String(st.gid),
-      mode: (st.mode & parseInt('777', 8)).toString(8),
+      // Windows 的 stat 没有 POSIX 的 uid/gid/mode，显示 undefined / 666 没有意义
+      owner: st.uid != null ? (parsePasswd()[st.uid] || String(st.uid)) : null,
+      group: st.gid != null ? (parseGroup()[st.gid] || String(st.gid)) : null,
+      mode: st.uid != null ? (st.mode & parseInt('777', 8)).toString(8) : null,
       ext: isDir ? '' : path.extname(p),
       category: isDir ? '文件夹' : categorize(path.extname(p)),
       name: path.basename(p),
@@ -475,9 +476,6 @@ ipcMain.handle('fs:detail', async (e, p) => {
     };
   } catch (err) { return { error: err.message }; }
 });
-
-// ---------- IPC: 多选文件对话框（添加文件用） ----------
-// （已合并到上方 dialog:pickFolder / dialog:pickFiles）
 
 // ---------- 文件文库（多文库管理：文库 → 大类 → 组 → 文件） ----------
 const DEFAULT_CATS = ['漫画', '小说'];
@@ -489,6 +487,84 @@ function tagColor(name) {
   let h = 0;
   for (const c of String(name)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
   return TAG_COLORS[h % TAG_COLORS.length];
+}
+
+// ---------- 层级元数据：文库 / 大类 / 组 / 文件共用的「作者 / 标签 / 来源」 ----------
+// 键是相对文库根目录的路径：''=文库本身，'大类'=大类，'大类/组'=组，'大类/组/文件'=文件。
+// 作者与来源用字符串数组（可多值），标签用 {name,color} 数组；文件层级只保留标签。
+// 上级的非空信息由渲染层在显示时向下合并，账本里只存每一级「自己填的值」。
+function emptyMeta() { return { author: [], tags: [], source: [] }; }
+function levelOfRel(rel) {
+  const n = rel ? String(rel).split('/').filter(Boolean).length : 0;
+  return n === 0 ? 'lib' : n === 1 ? 'cat' : n === 2 ? 'group' : 'file';
+}
+function metaList(v) {
+  const arr = Array.isArray(v) ? v : [v];
+  return [...new Set(arr.map(x => String(x == null ? '' : x).trim()).filter(Boolean))];
+}
+function mergeTags(a, b) {
+  const out = [], seen = new Set();
+  for (const t of [...(a || []), ...(b || [])]) {
+    const name = String(typeof t === 'string' ? t : ((t && t.name) || '')).trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push({ name, color: (t && t.color) || tagColor(name) });
+  }
+  return out;
+}
+function normMeta(raw, rel) {
+  const m = emptyMeta();
+  if (!raw || typeof raw !== 'object') return m;
+  if (levelOfRel(rel) !== 'file') {
+    m.author = metaList(raw.author);
+    m.source = metaList(raw.source);
+  }
+  m.tags = mergeTags([], raw.tags);
+  return m;
+}
+function normMetaMap(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [rel, v] of Object.entries(raw)) {
+    const m = normMeta(v, rel);
+    if (m.author.length || m.source.length || m.tags.length) out[rel] = m;
+  }
+  return out;
+}
+// 从账本读取 meta：新版直接读 meta；旧版（组标签 + fileMeta）一次性迁移，文件级作者/来源上提到所属组
+function metaFromLedger(led, root) {
+  if (led && led.meta && typeof led.meta === 'object' && !Array.isArray(led.meta))
+    return normMetaMap(led.meta);
+  const out = {};
+  for (const c of ((led && led.categories) || [])) {
+    for (const g of (c.groups || [])) {
+      if (!(g.tags || []).length) continue;
+      const rel = relKey(led.root || root, g.path);
+      const cur = out[rel] || emptyMeta();
+      cur.tags = mergeTags(cur.tags, g.tags);
+      out[rel] = cur;
+    }
+  }
+  const fm = (led && led.fileMeta && typeof led.fileMeta === 'object' && !Array.isArray(led.fileMeta))
+    ? led.fileMeta : {};
+  for (const [rel, v] of Object.entries(fm)) {
+    const parts = String(rel).split('/').filter(Boolean);
+    if (parts.length < 3) continue;                 // 文件级信息一律上提到所属组
+    const gr = parts.slice(0, 2).join('/');
+    const src = normMeta(v, gr);
+    const cur = out[gr] || emptyMeta();
+    cur.author = [...new Set([...cur.author, ...src.author])];
+    cur.source = [...new Set([...cur.source, ...src.source])];
+    cur.tags = mergeTags(cur.tags, src.tags);
+    out[gr] = cur;
+  }
+  return out;
+}
+function persistMeta(led, mm) {
+  led.meta = mm;
+  led.metaVersion = 2;
+  delete led.fileMeta;                            // 旧格式不再保留
+  return led;
 }
 
 function readRegistry() {
@@ -522,7 +598,7 @@ async function collectFiles(dir, depth = 0) {
   return { fileCount, totalSize, files };
 }
 
-// 解析组文件夹名：当前格式 "20261027_0001_组名"；兼容 v1.2 "2026年10月27日11时_000001_组名" 与 v1.1 "001_组名"
+// 解析组文件夹名：当前格式 "YYYYMMDD_0001_组名"；兼容早期版本的中文日期格式与纯序号格式
 function parseGroupName(name) {
   let m = name.match(/^(\d{8})_(\d{4})_(.+)$/);
   if (m) return { date: m[1], seq: parseInt(m[2]), displayName: m[3] };
@@ -537,25 +613,23 @@ function parseGroupName(name) {
 // （Windows 的 path.relative 返回 "漫画\组名"，Linux 记的是 "漫画/组名"）
 function relKey(root, p) { return path.relative(root, p).replace(/\\/g, '/'); }
 
-// 扫描文库：统计各大类/组，合并保留账本中的标签与预览图元数据，写回账本
+// 扫描文库：统计各大类/组，合并保留账本中的层级元数据与预览图，写回账本
 // 抽成函数，供「打开文库」与「重新定位文库」共用
 async function scanLibrary(root) {
   try {
     await fs.mkdir(root, { recursive: true });
-    // 读取旧账本，按"相对路径"保留每个组的标签和预览图（迁移后相对路径不变，元数据不丢）
-    const oldMeta = {};
-    let libName = null;
     const ledgerPath = path.join(root, '.library-index.json');
-    try {
-      const old = JSON.parse(await fs.readFile(ledgerPath, 'utf8'));
-      if (old.name) libName = old.name;
-      for (const c of (old.categories || [])) {
-        for (const g of (c.groups || [])) {
-          const rel = relKey(old.root || root, g.path);
-          if (g.tags?.length || g.cover) oldMeta[rel] = { tags: g.tags || [], cover: g.cover || null };
-        }
+    let old = null;
+    try { old = JSON.parse(await fs.readFile(ledgerPath, 'utf8')); } catch {}
+    const libName = old && old.name ? old.name : null;
+    // 预览图按相对路径保留（文库整体迁移后相对路径不变，不会丢）
+    const oldCover = {};
+    if (old) for (const c of (old.categories || []))
+      for (const g of (c.groups || [])) {
+        if (g.cover) oldCover[relKey(old.root || root, g.path)] = g.cover;
       }
-    } catch {}
+    // 作者 / 标签 / 来源：新版读 meta，旧版自动迁移
+    const metaMap = metaFromLedger(old, root);
     const catNames = [];
     for (const n of await fs.readdir(root)) {
       if (n.startsWith('.')) continue;
@@ -564,6 +638,8 @@ async function scanLibrary(root) {
     const categories = [];
     for (const cn of catNames) {
       const catPath = path.join(root, cn);
+      const catRel = relKey(root, catPath);
+      const catOwn = metaMap[catRel] || emptyMeta();
       const groups = [];
       let gNames = [];
       try { gNames = await fs.readdir(catPath); } catch {}
@@ -573,12 +649,18 @@ async function scanLibrary(root) {
         let st;
         try { st = await fs.stat(gp); } catch { continue; }
         if (!st.isDirectory()) continue;
-        const { fileCount, totalSize, files } = await collectFiles(gp);
+        const collected = await collectFiles(gp);
+        const { fileCount, totalSize } = collected;
+        // 每个对象都带上相对路径 rel，渲染层据此计算继承链；tags 是「本级自有标签」
+        const files = collected.files.map(f => {
+          const rel = relKey(root, f.path);
+          const own = metaMap[rel] || emptyMeta();
+          return { ...f, rel, tags: own.tags };
+        });
         const parsed = parseGroupName(g);
         const rel = relKey(root, gp);
-        const meta = oldMeta[rel] || { tags: [], cover: null };
-        // 预览图：优先用账本里记录的；不存在时自动取组内第一张图片
-        let cover = meta.cover;
+        const meta = metaMap[rel] || emptyMeta();
+        let cover = oldCover[rel];
         if (!cover || !fss.existsSync(cover)) {
           const img = files.find(f => f.category === '图片');
           cover = img ? img.path : null;
@@ -588,25 +670,31 @@ async function scanLibrary(root) {
           date: parsed.date,
           name: g,
           displayName: parsed.displayName,
-          path: gp,
+          path: gp, rel,
           fileCount, totalSize, files,
           mtime: st.mtimeMs,
-          tags: meta.tags || [],
+          tags: meta.tags,
           cover
         });
       }
       groups.sort((a, b) => ((a.seq ?? 1e9) - (b.seq ?? 1e9)) || a.name.localeCompare(b.name, 'zh'));
       categories.push({
-        name: cn, path: catPath,
+        name: cn, path: catPath, rel: catRel,
         groupCount: groups.length,
         totalSize: groups.reduce((s, g) => s + g.totalSize, 0),
+        tags: catOwn.tags,
         groups
       });
     }
-    const indexData = { name: libName || path.basename(root), updatedAt: Date.now(), root, categories };
+    const indexData = {
+      name: libName || path.basename(root), updatedAt: Date.now(), root, rel: '',
+      metaVersion: 2, meta: metaMap,
+      tags: (metaMap[''] || emptyMeta()).tags,
+      categories
+    };
     // 账本随文库走（隐藏文件，不会被当作大类）
     try {
-      await fs.writeFile(path.join(root, '.library-index.json'), JSON.stringify(indexData, null, 2));
+      await fs.writeFile(ledgerPath, JSON.stringify(indexData, null, 2));
     } catch {}
     return indexData;
   } catch (err) { return { error: err.message }; }
@@ -669,13 +757,14 @@ ipcMain.handle('lib:list', async () => {
     let exists = false, mtime = null;
     try { const st = await fs.stat(lib.path); exists = st.isDirectory(); mtime = st.mtimeMs; } catch {}
     // 概览所需的统计从各文库自带的账本读取（比逐个重新扫描快得多）
-    let catCount = 0, groupCount = 0, totalSize = 0, fileCount = 0, updatedAt = null, cover = null;
+    let catCount = 0, groupCount = 0, totalSize = 0, fileCount = 0, updatedAt = null, cover = null, libMeta = null;
     if (exists) {
       try {
         const d = JSON.parse(await fs.readFile(path.join(lib.path, '.library-index.json'), 'utf8'));
         const cats = d.categories || [];
         catCount = cats.length;
         updatedAt = d.updatedAt || null;
+        if (d.meta && typeof d.meta === 'object') libMeta = d.meta[''] || null;
         for (const c of cats) {
           for (const g of (c.groups || [])) {
             groupCount++;
@@ -687,7 +776,7 @@ ipcMain.handle('lib:list', async () => {
       } catch { /* 账本缺失或损坏时按空文库展示 */ }
     }
     libs.push({ name: lib.name, path: lib.path, exists, mtime,
-      catCount, groupCount, fileCount, totalSize, updatedAt, cover });
+      catCount, groupCount, fileCount, totalSize, updatedAt, cover, meta: libMeta });
   }
   return libs;
 });
@@ -755,14 +844,17 @@ ipcMain.handle('lib:migrate', async (e, { oldPath, newParent }) => {
 });
 
 // 新建组：命名 "YYYYMMDD_4位序号_组名"，序号按"同日"接续（换一天重新从 1 开始）
-ipcMain.handle('lib:createGroup', async (e, { root, categoryName, groupName }) => {
-  if (!isAllowed(root)) return { error: '无权访问该目录' };
+// 抽成函数：界面「新建组」与「批量添加」共用同一套命名与校验规则
+async function createGroupFolder(root, categoryName, groupName) {
   const safeName = String(groupName || '').trim().replace(/[/\\:*?"<>|]/g, '');
+  const safeCat = String(categoryName || '').trim();
   if (!safeName) return { error: '组名不能为空' };
-  const bad = nameError(safeName);
+  if (!safeCat) return { error: '大类名称不能为空' };
+  const bad = nameError(safeName) || nameError(safeCat);
   if (bad) return { error: bad };
+  if (!isAllowed(root)) return { error: '无权访问该目录' };
   try {
-    const catPath = path.join(root, categoryName);
+    const catPath = path.join(root, safeCat);
     await fs.mkdir(catPath, { recursive: true });
     const now = new Date();
     const dateStr = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
@@ -778,6 +870,9 @@ ipcMain.handle('lib:createGroup', async (e, { root, categoryName, groupName }) =
     await fs.mkdir(groupPath);
     return { ok: true, seq, name: folderName, path: groupPath };
   } catch (err) { return { error: err.message }; }
+}
+ipcMain.handle('lib:createGroup', async (e, { root, categoryName, groupName }) => {
+  return createGroupFolder(root, categoryName, groupName);
 });
 
 // 向组内添加文件（复制）
@@ -818,19 +913,280 @@ async function updateGroupMeta(root, groupPath, patch) {
   } catch (err) { return { error: err.message }; }
 }
 
+// 写入某一层级的自有信息（整级替换）。文件层级只允许 tags。
+async function writeMeta(root, rel, patch, level) {
+  const lp = path.join(root, '.library-index.json');
+  let led = {};
+  try { led = JSON.parse(await fs.readFile(lp, 'utf8')); } catch {}
+  const mm = metaFromLedger(led, root);
+  const cur = mm[rel] || emptyMeta();
+  const next = emptyMeta();
+  if ((level || levelOfRel(rel)) !== 'file') {
+    next.author = patch.author !== undefined ? metaList(patch.author) : cur.author;
+    next.source = patch.source !== undefined ? metaList(patch.source) : cur.source;
+  }
+  next.tags = patch.tags !== undefined ? mergeTags([], patch.tags) : cur.tags;
+  if (next.author.length || next.source.length || next.tags.length) mm[rel] = next;
+  else delete mm[rel];
+  await fs.writeFile(lp, JSON.stringify(persistMeta(led, mm), null, 2));
+  return { ok: true, meta: next };
+}
+// 批量添加用：保留该组已有的作者 / 来源 / 标签，把新一批的值合并进去（去重）
+async function mergeMeta(root, rel, patch, level) {
+  const lp = path.join(root, '.library-index.json');
+  let led = {};
+  try { led = JSON.parse(await fs.readFile(lp, 'utf8')); } catch {}
+  const mm = metaFromLedger(led, root);
+  const cur = mm[rel] || emptyMeta();
+  const next = {
+    author: [...new Set([...cur.author, ...metaList(patch.author)])],
+    source: [...new Set([...cur.source, ...metaList(patch.source)])],
+    tags: mergeTags(cur.tags, patch.tags)
+  };
+  if ((level || levelOfRel(rel)) === 'file') { next.author = []; next.source = []; }
+  if (next.author.length || next.source.length || next.tags.length) mm[rel] = next;
+  else delete mm[rel];
+  await fs.writeFile(lp, JSON.stringify(persistMeta(led, mm), null, 2));
+  return next;
+}
+ipcMain.handle('lib:setMeta', async (e, { root, rel, level, patch }) => {
+  if (!isAllowed(root)) return { error: '无权访问该文库' };
+  try { return await writeMeta(root, String(rel || ''), patch || {}, level); }
+  catch (err) { return { error: err.message }; }
+});
+
 // 设置组标签（整组替换；颜色按标签名自动分配）
 ipcMain.handle('lib:setTags', async (e, { root, groupPath, tags }) => {
   if (!isAllowed(root)) return { error: '无权访问该目录' };
-  const names = [...new Set((tags || []).map(t => String(t).trim()).filter(Boolean))];
-  return updateGroupMeta(root, groupPath, {
-    tags: names.map(n => ({ name: n, color: tagColor(n) }))
-  });
+  return writeMeta(root, relKey(root, groupPath), { tags: tags || [] }, 'group');
 });
 
 // 设置组预览图
 ipcMain.handle('lib:setCover', async (e, { root, groupPath, cover }) => {
   if (!isAllowed(root)) return { error: '无权访问该目录' };
   return updateGroupMeta(root, groupPath, { cover: cover || null });
+});
+
+// ---------- 批量添加：一次导入一批文件，并把作者 / 标签 / 来源记到目标组 ----------
+// 文件层级不记录作者与来源，统一由组向下继承；账本用相对路径做键，
+// 文库整体迁移 / 换电脑重新定位后仍能对上号。
+const BATCH_MAX_FILES = 5000;
+
+// 找出某个路径属于哪个已登记文库（有多个时取最长匹配）
+function libraryRootFor(p) {
+  const reg = readRegistry();
+  let best = null;
+  const abs = path.resolve(p);
+  for (const lib of reg.libraries) {
+    const r = path.resolve(lib.path);
+    if ((abs === r || abs.startsWith(r + path.sep)) && (!best || r.length > best.length)) best = r;
+  }
+  return best;
+}
+
+// 重命名 / 迁移后同步 meta 的键：文件改名改键，目录改名改前缀；跨文库时搬到目标账本
+async function rewriteMeta(oldPath, newPath, isDir) {
+  const oldRoot = libraryRootFor(oldPath);
+  const newRoot = libraryRootFor(newPath);
+  const root = oldRoot || newRoot;
+  if (!root) return;
+  const srcLedger = path.join(root, '.library-index.json');
+  let ledger = {};
+  try { ledger = JSON.parse(await fs.readFile(srcLedger, 'utf8')); } catch { return; }
+  const mm = metaFromLedger(ledger, root);
+  const oldRel = relKey(root, oldPath);
+  const newRel = relKey(newRoot || root, newPath);
+  const rest = {}, moved = {};
+  for (const [k, v] of Object.entries(mm)) {
+    const hit = isDir ? (k === oldRel || k.startsWith(oldRel + '/')) : k === oldRel;
+    if (hit) moved[newRel + k.slice(oldRel.length)] = v;
+    else rest[k] = v;
+  }
+  if (!Object.keys(moved).length) return;
+  try {
+    if (newRoot && newRoot !== oldRoot) {
+      await fs.writeFile(srcLedger, JSON.stringify(persistMeta(ledger, rest), null, 2));
+      const dstLedger = path.join(newRoot, '.library-index.json');
+      let other = {};
+      try { other = JSON.parse(await fs.readFile(dstLedger, 'utf8')); } catch {}
+      const dstMap = metaFromLedger(other, newRoot);
+      for (const [k, v] of Object.entries(moved)) dstMap[k] = v;
+      await fs.writeFile(dstLedger, JSON.stringify(persistMeta(other, dstMap), null, 2));
+    } else {
+      await fs.writeFile(srcLedger, JSON.stringify(persistMeta(ledger, { ...rest, ...moved }), null, 2));
+    }
+  } catch (err) { console.log('[批次] 元数据键同步失败：' + err.message); }
+}
+
+// 可选的目标位置：只读注册表与各文库账本，不扫描文件内容，速度快
+ipcMain.handle('lib:locations', async () => {
+  const reg = readRegistry();
+  const out = [];
+  for (const lib of reg.libraries) {
+    let exists = false;
+    try { exists = (await fs.stat(lib.path)).isDirectory(); } catch {}
+    if (!exists || !isAllowed(lib.path)) continue;
+    const categories = [];
+    let ledger = null;
+    try { ledger = JSON.parse(await fs.readFile(path.join(lib.path, '.library-index.json'), 'utf8')); } catch {}
+    if (ledger && Array.isArray(ledger.categories)) {
+      for (const c of ledger.categories) {
+        const catName = c.name || path.basename(c.path);
+        const catPath = path.join(lib.path, catName);
+        categories.push({
+          name: catName, path: catPath,
+          groups: (c.groups || []).map(g => {
+            const gn = g.name || path.basename(g.path);
+            return { name: gn, displayName: g.displayName || parseGroupName(gn).displayName, path: path.join(catPath, gn) };
+          })
+        });
+      }
+    } else {
+      // 账本还没生成时，直接按磁盘目录读一遍（大类 → 组）
+      try {
+        for (const n of await fs.readdir(lib.path)) {
+          if (n.startsWith('.')) continue;
+          const cp = path.join(lib.path, n);
+          try { if (!(await fs.stat(cp)).isDirectory()) continue; } catch { continue; }
+          const groups = [];
+          try {
+            for (const gn of await fs.readdir(cp)) {
+              if (gn.startsWith('.')) continue;
+              const gp = path.join(cp, gn);
+              try { if ((await fs.stat(gp)).isDirectory()) groups.push({ name: gn, displayName: parseGroupName(gn).displayName, path: gp }); } catch {}
+            }
+          } catch {}
+          categories.push({ name: n, path: cp, groups });
+        }
+      } catch {}
+    }
+    out.push({ name: lib.name || path.basename(lib.path), path: lib.path, categories });
+  }
+  return out;
+});
+
+// 展开待添加项：文件直接收，文件夹递归展开；跳过隐藏项与目标文库内部的文件
+async function expandBatchSources(sources, root) {
+  const files = [], seen = new Set(), failed = [];
+  const rootAbs = path.resolve(root);
+  let overflow = false, skipped = 0;
+  const inRoot = (p) => {
+    const a = path.resolve(p);
+    return a === rootAbs || a.startsWith(rootAbs + path.sep);
+  };
+  const walk = async (dir, depth) => {
+    if (depth > 8 || overflow) return;
+    let names;
+    try { names = await fs.readdir(dir); } catch (err) { failed.push({ src: dir, reason: err.message }); return; }
+    for (const n of names) {
+      if (n.startsWith('.')) continue;
+      const full = path.join(dir, n);
+      let st;
+      try { st = await fs.stat(full); } catch { continue; }
+      if (st.isDirectory()) { await walk(full, depth + 1); continue; }
+      if (!st.isFile()) continue;
+      if (inRoot(full)) { skipped++; continue; }
+      const abs = path.resolve(full);
+      if (seen.has(abs)) continue;
+      if (files.length >= BATCH_MAX_FILES) { overflow = true; return; }
+      seen.add(abs);
+      files.push(full);
+    }
+  };
+  for (const src of (sources || [])) {
+    if (!isAllowed(src)) { failed.push({ src, reason: '无权访问该路径' }); continue; }
+    let st;
+    try { st = await fs.stat(src); } catch (err) { failed.push({ src, reason: err.message }); continue; }
+    if (st.isDirectory()) {
+      if (inRoot(src)) { skipped++; continue; }
+      await walk(src, 0);
+      continue;
+    }
+    if (!st.isFile()) continue;
+    if (inRoot(src)) { skipped++; continue; }
+    const abs = path.resolve(src);
+    if (!seen.has(abs)) { seen.add(abs); files.push(src); }
+  }
+  return { files, failed, overflow, skipped };
+}
+
+ipcMain.handle('lib:batchAdd', async (e, payload) => {
+  const { root, target, sources, author, tags, source } = payload || {};
+  if (!root || !isAllowed(root)) return { error: '无权访问该文库' };
+  let rootStat;
+  try { rootStat = await fs.stat(root); } catch { return { error: '文库目录不存在' }; }
+  if (!rootStat.isDirectory()) return { error: '文库路径不是文件夹' };
+  const rootAbs = path.resolve(root);
+  const inside = (p) => {
+    const a = path.resolve(p);
+    return a === rootAbs || a.startsWith(rootAbs + path.sep);
+  };
+
+  // 1. 先展开待添加项：没有可添加文件时不新建空组
+  const expanded = await expandBatchSources(sources, root);
+  if (expanded.overflow) return { error: `一次最多添加 ${BATCH_MAX_FILES} 个文件，请分批操作` };
+  if (!expanded.files.length) return { error: '没有可添加的文件（所选内容为空，或都在目标文库内部）' };
+
+  // 2. 解析目标：选「组」直接加入；选「文件库 / 大类」自动新建一个组
+  let groupPath;
+  if (target && target.level === 'group') {
+    groupPath = target.path;
+    if (!groupPath || !isAllowed(groupPath) || !inside(groupPath)) return { error: '所选组不在该文库内' };
+    let gs;
+    try { gs = await fs.stat(groupPath); } catch { return { error: '所选组已不存在，请重新扫描后再试' }; }
+    if (!gs.isDirectory()) return { error: '所选组不是文件夹' };
+  } else {
+    let categoryName;
+    if (target && target.level === 'category') {
+      if (!inside(target.path)) return { error: '所选大类不在该文库内' };
+      categoryName = path.basename(target.path);
+    } else {
+      categoryName = String((target && (target.newCategoryName || target.categoryName)) || '').trim();
+    }
+    const groupName = String((target && target.groupName) || '').trim();
+    if (!categoryName) return { error: '请指定归入哪个大类' };
+    if (!groupName) return { error: '请填写新组名称' };
+    const created = await createGroupFolder(root, categoryName, groupName);
+    if (created.error) return { error: created.error };
+    groupPath = created.path;
+  }
+
+  // 3. 复制文件：同名自动加序号；Windows 不区分大小写，重名判断也要忽略大小写
+  const norm = (s) => process.platform === 'win32' ? s.toLowerCase() : s;
+  const reserved = new Set();
+  try { for (const n of await fs.readdir(groupPath)) reserved.add(norm(n)); } catch {}
+  const cleanTags = mergeTags([], (tags || []).map(t => String(t).trim()));
+  const cleanAuthor = String(author || '').trim();
+  const cleanSource = String(source || '').trim();
+  let done = 0;
+  const failed = [...expanded.failed];
+  for (const src of expanded.files) {
+    const base = path.basename(src);
+    const ext = path.extname(base);
+    const stem = path.basename(base, ext);
+    let name = base, i = 1;
+    while (reserved.has(norm(name))) name = `${stem}_${i++}${ext}`;
+    const dest = path.join(groupPath, name);
+    try {
+      await fs.copyFile(src, dest);
+      reserved.add(norm(name));
+      done++;
+    } catch (err) {
+      failed.push({ src, reason: err.message });
+    }
+  }
+
+  // 4. 作者 / 标签 / 来源统一记到「组」上；文件层级不记录作者与来源，靠继承显示。
+  //     已有信息保留，新一批的值合并进去（去重），重复往同一组添加不会互相覆盖。
+  try {
+    await mergeMeta(root, relKey(root, groupPath), {
+      author: cleanAuthor ? [cleanAuthor] : [],
+      tags: cleanTags,
+      source: cleanSource ? [cleanSource] : []
+    }, 'group');
+  } catch (err) { console.log('[批次] 组信息写入失败：' + err.message); }
+
+  return { ok: true, root, groupPath, done, failed, skipped: expanded.skipped };
 });
 
 // ---------- 重命名（文库 / 大类 / 组 / 文件） ----------
@@ -856,9 +1212,11 @@ ipcMain.handle('lib:rename', async (e, { kind, target, newName }) => {
   if (fss.existsSync(newPath)) return { error: '目标位置已存在同名：' + newBase };
   try {
     await fs.rename(target, newPath);
+    // 改名后同步账本里的层级元数据键（相对路径变了）
+    if (kind !== 'lib' && kind !== 'library') await rewriteMeta(target, newPath, kind !== 'file');
   } catch (err) { return { error: err.message }; }
   // 文库改名：同步更新注册表与账本里的名称/路径
-  if (kind === 'library') {
+  if (kind === 'lib' || kind === 'library') {
     const reg = readRegistry();
     const lib = reg.libraries.find(l => l.path === target);
     if (lib) { lib.path = newPath; lib.name = safe; writeRegistry(reg); }
@@ -892,6 +1250,10 @@ ipcMain.handle('lib:move', async (e, { target, destDir }) => {
       await copyDeep(target, dest);            // 跨磁盘：复制后删除原位置
       await fs.rm(target, { recursive: true, force: true });
     }
+    // 迁移后同步账本里的层级元数据键（跨文库时一并搬到目标账本）
+    let movedIsDir = false;
+    try { movedIsDir = (await fs.stat(dest)).isDirectory(); } catch {}
+    await rewriteMeta(target, dest, movedIsDir);
     return { ok: true, path: dest };
   } catch (err) { return { error: err.message }; }
 });

@@ -1,7 +1,7 @@
 {
   "name": "local-file-manager",
-  "version": "0.1.0",
-  "description": "本地文件管理器 - 浏览、搜索、整理归档（Electron 跨平台）",
+  "version": "0.2.0",
+  "description": "本地文件文库管理器 - 多文库归档、标签、预览（Electron 跨平台）",
   "main": "main.js",
   "scripts": {
     "start": "electron .",

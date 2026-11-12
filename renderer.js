@@ -1,6 +1,7 @@
-/* 渲染进程逻辑 —— v1.5.0（三栏布局；启动时中间区显示所有文库） */
+/* 渲染进程逻辑：三栏布局，启动时中间区显示所有文库 */
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
+let batchState = null;  // 批量添加表单状态（独立于 DOM，选择器可能临时占用通用弹窗）
 
 const TEXT_EXTS = new Set(['txt', 'md', 'csv', 'log', 'json', 'js', 'py', 'c', 'cpp', 'h',
   'java', 'html', 'css', 'xml', 'sh', 'sql', 'ini', 'conf', 'yaml', 'yml', 'ts', 'go', 'rs']);
@@ -36,6 +37,8 @@ const state = {
   libTagFilter: null,           // 标签筛选（标签名）
   libSearch: '',                // 文库内搜索关键词
   libCatFilter: '全部',         // 文库内类型筛选
+  // 按标签检索时要搜索哪些层级（文库 / 大类 / 组 / 文件），可多选
+  tagLevels: new Set(JSON.parse(localStorage.getItem('fm_tag_levels') || '["lib","cat","group","file"]')),
   libPageNum: 1,                // 大类组网格当前页
   libPreviewFile: null,         // 正在预览的文件（组内或搜索结果）
 };
@@ -57,6 +60,136 @@ function fmtDate(ms) {
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
+// ---------- 层级元数据：作者 / 标签 / 来源 ----------
+// 账本只存每一级「自己填的值」；显示时把文库 → 大类 → 组 → 文件这条链上的
+// 非空信息合并出来（标签取并集，作者 / 来源多值并列并标注来源层级）。
+// 文件层级不记录作者与来源，只保留标签；没有标签时文件详情不显示标签区。
+const META_LEVELS = [
+  { key: 'lib', label: '文库' }, { key: 'cat', label: '大类' },
+  { key: 'group', label: '组' }, { key: 'file', label: '文件' }
+];
+const META_TAG_COLORS = ['#e74c3c', '#e67e22', '#d4a017', '#2ecc71', '#1abc9c', '#3498db', '#9b59b6', '#e91e63'];
+function metaTagColor(name) {
+  let h = 0;
+  for (const c of String(name)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return META_TAG_COLORS[h % META_TAG_COLORS.length];
+}
+function ownMeta(rel) {
+  const mm = state.libData && state.libData.meta ? state.libData.meta : null;
+  return (mm && mm[rel || '']) || { author: [], tags: [], source: [] };
+}
+// '' → '大类' → '大类/组' → '大类/组/文件'：从文库到目标对象的完整继承链
+function metaChain(rel) {
+  const chain = [''];
+  let cur = '';
+  for (const p of String(rel || '').split('/').filter(Boolean)) {
+    cur = cur ? cur + '/' + p : p;
+    chain.push(cur);
+  }
+  return chain;
+}
+function chainLevel(i) { return i === 0 ? '文库' : i === 1 ? '大类' : i === 2 ? '组' : '文件'; }
+function effectiveMeta(rel) {
+  const authors = [], sources = [], tags = new Map();
+  metaChain(rel).forEach((key, i) => {
+    const m = ownMeta(key);
+    const from = chainLevel(i);
+    for (const v of (m.author || []))
+      if (v && !authors.some(x => x.value === v)) authors.push({ value: v, from });
+    for (const v of (m.source || []))
+      if (v && !sources.some(x => x.value === v)) sources.push({ value: v, from });
+    for (const x of (m.tags || [])) {
+      const name = typeof x === 'string' ? x : x.name;
+      const color = (typeof x === 'string' ? '' : x.color) || metaTagColor(name);
+      if (name && !tags.has(name)) tags.set(name, { name, color, from });
+    }
+  });
+  return { authors, sources, tags: [...tags.values()] };
+}
+function tagHit(rel, name) {
+  return !!name && effectiveMeta(rel).tags.some(x => x.name === name);
+}
+function metaListHTML(list, level) {
+  if (!list.length) return '<span class="meta-empty">空</span>';
+  return list.map(x => escapeHtml(x.value) +
+    (x.from === level ? '' : `<small class="meta-from">${escapeHtml(x.from)}</small>`)).join('、');
+}
+function metaTagsHTML(tags, level) {
+  if (!tags.length) return '<span class="meta-empty">空</span>';
+  return `<span class="detail-tags">${tags.map(x =>
+    `<span class="tag-chip mini" style="--tag-c:${escapeHtml(x.color)}" title="来自${escapeHtml(x.from)}">${escapeHtml(x.name)}${x.from === level ? '' : `<i class="meta-from">${escapeHtml(x.from)}</i>`}</span>`
+  ).join('')}</span>`;
+}
+function metaRowsHTML(authors, tags, sources, level) {
+  return `<div class="detail-rows">
+    <div class="detail-row"><span class="d-label">作者</span><span class="d-value">${metaListHTML(authors, level)}</span></div>
+    <div class="detail-row"><span class="d-label">标签</span><span class="d-value">${metaTagsHTML(tags, level)}</span></div>
+    <div class="detail-row"><span class="d-label">来源</span><span class="d-value">${metaListHTML(sources, level)}</span></div>
+  </div>`;
+}
+// 文库 / 大类 / 组：统计信息之外固定显示 3 类信息，未填写显示「空」
+function metaBlockHTML(rel, level, name) {
+  const eff = effectiveMeta(rel);
+  return `<div class="box-title" style="padding:10px 0 4px">维护信息</div>
+    ${metaRowsHTML(eff.authors, eff.tags, eff.sources, (META_LEVELS.find(x => x.key === level) || {}).label || level)}
+    <button id="btn-edit-meta" class="ghost-btn" style="margin-top:8px">编辑信息</button>
+    <div class="hint">带层级小标记的值由上级继承而来；文件不记录作者与来源，只继承标签。</div>`;
+}
+// 文件：只有标签；没有任何标签时整块不显示
+function metaFileBlock(e) {
+  if (!e || !e.rel) return '';
+  const eff = effectiveMeta(e.rel);
+  if (!eff.tags.length) return '';
+  return `<div class="box-title" style="padding:10px 0 4px">标签</div>
+    <div class="detail-tags">${metaTagsHTML(eff.tags, '文件')}</div>`;
+}
+// 「全部文库」视图里的文库卡片：没有当前库的继承链，展示该库自己填的值
+function ownMetaBlockHTML(own, level) {
+  const mk = arr => (arr || []).map(v => ({ value: v, from: level }));
+  const tags = (own.tags || []).map(x => {
+    const n = typeof x === 'string' ? x : x.name;
+    return { name: n, color: (typeof x === 'string' ? '' : x.color) || metaTagColor(n), from: level };
+  });
+  return `<div class="box-title" style="padding:10px 0 4px">维护信息</div>
+    ${metaRowsHTML(mk(own.author), tags, mk(own.source), level)}`;
+}
+function splitMetaList(v) {
+  return [...new Set(String(v || '').split(/[、,，;；\n]+/).map(x => x.trim()).filter(Boolean))];
+}
+// 统一的编辑入口：只改本级自己填的值，上级信息自动继承，不在本级重复存储
+function bindMetaEdit(rel, level, name, root, ownOverride) {
+  const btn = $('#btn-edit-meta');
+  if (!btn || rel == null) return;
+  btn.onclick = () => {
+    const own = ownOverride || ownMeta(rel);
+    const isFile = level === 'file';
+    const tagVal = (own.tags || []).map(x => typeof x === 'string' ? x : x.name).join('、');
+    const body = `${isFile ? '' : `
+      <label class="field-label">作者（多个用「、」分隔，留空表示不填写）</label>
+      <input id="m-author" value="${escapeHtml((own.author || []).join('、'))}" spellcheck="false">
+      <label class="field-label">来源（多个用「、」分隔，留空表示不填写）</label>
+      <input id="m-source" value="${escapeHtml((own.source || []).join('、'))}" spellcheck="false">`}
+      <label class="field-label">标签（多个用「、」分隔）</label>
+      <input id="m-tags" value="${escapeHtml(tagVal)}" spellcheck="false">
+      <div class="hint">这里只修改「${escapeHtml(name || '')}」自己的信息。上级的非空信息会自动继承下来，不需要重复填写。${isFile ? '文件不记录作者与来源。' : ''}</div>`;
+    showModal(`编辑信息 · ${name || ''}`, body, async () => {
+      const patch = { tags: splitMetaList($('#m-tags') ? $('#m-tags').value : '') };
+      if (!isFile) {
+        patch.author = splitMetaList($('#m-author') ? $('#m-author').value : '');
+        patch.source = splitMetaList($('#m-source') ? $('#m-source').value : '');
+      }
+      const r = await window.api.libSetMeta(root || state.libRoot, rel, level, patch);
+      if (r && r.error) { toast(r.error, true); return true; }
+      toast('已保存');
+      if ((root || state.libRoot) === state.libRoot) await loadLibrary(true);
+      else await loadLibList();
+      renderTagChips();
+      refreshDetails();
+      return;
+    }, '保存');
+  };
+}
+
 // ---------- 跨平台路径工具（Linux 用 "/"，Windows 用 "\"，两边都要认） ----------
 const SEP_RE = /[\\/]/;
 function pathSegs(p) { return String(p == null ? '' : p).split(SEP_RE).filter(Boolean); }
@@ -94,25 +227,38 @@ function parentOf(p) {
 }
 
 // ---------- 通用对话框 ----------
-function showModal(title, bodyHTML, onOK, okText = '确定', onCancel = null) {
+function showModal(title, bodyHTML, onOK, okText = '确定', onCancel = null, opts = {}) {
   $('#modal-title').textContent = title;
   $('#modal-body').innerHTML = bodyHTML;
   $('#modal-ok').textContent = okText;
+  $('#modal-ok').disabled = false;
+  // 宽屏模式用于内容较多的表单（如「批量添加」）
+  $('#modal').classList.toggle('wide', !!opts.wide);
   $('#modal-mask').classList.remove('hidden');
-  const first = $('#modal-body input, #modal-body select');
-  if (first) setTimeout(() => first.focus(), 30);
+  if (!opts.noFocus) {
+    const first = $('#modal-body input, #modal-body select');
+    if (first) setTimeout(() => first.focus(), 30);
+  }
   $('#modal-ok').onclick = async () => {
     const keepOpen = await onOK();
     if (!keepOpen) hideModal();
   };
   $('#modal-cancel').onclick = () => { hideModal(); if (onCancel) onCancel(); };
-  // 输入框内按 Enter 直接触发确定（输入法选字过程中不触发，避免把候选词选择当成确定）
-  $('#modal-body').querySelectorAll('input').forEach(inp => {
-    bindEnter(inp, () => $('#modal-ok').click());
-  });
+  // 输入框内按 Enter 直接触发确定（输入法选字过程中不触发，避免把候选词选择当成确定）。
+  // 多项表单通过 opts.enterOK=false 关掉这个行为，由表单自己处理回车。
+  if (opts.enterOK !== false) {
+    $('#modal-body').querySelectorAll('input').forEach(inp => {
+      bindEnter(inp, () => $('#modal-ok').click());
+    });
+  }
 }
 function hideModal() { $('#modal-mask').classList.add('hidden'); }
-$('#modal-mask').addEventListener('mousedown', (e) => { if (e.target.id === 'modal-mask') hideModal(); });
+$('#modal-mask').addEventListener('mousedown', (e) => {
+  if (e.target.id !== 'modal-mask' || $('#modal').classList.contains('wide')) return;
+  hideModal();
+  // 内置选择器被点空白关闭时，恢复批量添加表单
+  if (batchState && !batchState.busy) setTimeout(() => { if (batchState && $('#modal-mask').classList.contains('hidden')) renderBatchForm(); }, 0);
+});
 
 // ---------- 内置选择器（系统文件对话框不可用/被取消时的回退） ----------
 function inlinePickFolder() {
@@ -453,13 +599,16 @@ async function showDetails(e) {
       ${detailRow('访问时间', fmtDate(d.atime))}
       <div class="detail-row" id="res-row" style="display:none">
         <span class="d-label">分辨率</span><span class="d-value" id="res-value"></span></div>
-      ${detailRow('所有者', escapeHtml(d.owner) + ' / ' + escapeHtml(d.group))}
-      ${detailRow('权限', d.mode)}
+      ${d.owner ? detailRow('所有者', escapeHtml(d.owner) + ' / ' + escapeHtml(d.group || '—')) : ''}
+      ${d.mode ? detailRow('权限', escapeHtml(d.mode)) : ''}
       ${detailRow('位置', escapeHtml(d.path))}
     </div>
-    <button id="btn-show-file" class="ghost-btn" style="margin-top:8px">在文件夹中显示</button>`;
+    ${metaFileBlock(e)}
+    <button id="btn-show-file" class="ghost-btn" style="margin-top:8px">在文件夹中显示</button>
+    ${e && e.rel ? `<button id="btn-edit-meta" class="ghost-btn" style="margin-top:6px">编辑标签</button>` : ''}`;
   body.innerHTML = rows;
   $('#btn-show-file').onclick = () => window.api.showInFolder(e.path);
+  if (e && e.rel) bindMetaEdit(e.rel, 'file', e.name);
 
   // 图片 / 视频补充分辨率
   if (!d.isDir && d.category === '图片') {
@@ -583,7 +732,10 @@ function clearCardSel() {
 function refreshDetails() {
   const s = state.cardSel;
   if (s) {
-    if (s.kind === 'lib') { const l = state.libLibraries.find(x => x.path === s.path); if (l) { showLibCardDetails(l); return; } }
+    if (s.kind === 'lib') {
+      if (s.path === state.libRoot && state.libData) { showLibraryDetails(state.libData); return; }
+      const l = state.libLibraries.find(x => x.path === s.path); if (l) { showLibCardDetails(l); return; }
+    }
     if (s.kind === 'cat') { const c = findCatByPath(s.path); if (c) { showCategoryDetails(c); return; } }
     if (s.kind === 'group') { const g = findGroupByPath(s.path); if (g) { showGroupDetails(g); return; } }
     if (s.kind === 'file') { const f = findLibFile(s.path); if (f) { showDetails(f); return; } }
@@ -606,12 +758,16 @@ function showLibCardDetails(l) {
     ${detailRow('总大小', fmtSize(l.totalSize || 0))}
     ${detailRow('路径', escapeHtml(l.path))}
   </div>
+  ${ownMetaBlockHTML(l.meta || {}, '文库')}
+  <button id="btn-edit-meta" class="ghost-btn" style="margin-top:8px">编辑信息</button>
   <div class="hint" style="margin-top:8px">双击卡片进入该文库</div>`;
+  bindMetaEdit('', 'lib', l.name, l.path, l.meta || {});
 }
 // 双击卡片：进入下一层
 function enterCard(kind, path) {
   state.cardSel = null;
   if (kind === 'lib') {
+    if (path === state.libRoot && state.libData) { gotoLibraryHome(); return; }
     const l = state.libLibraries.find(x => x.path === path);
     if (!l) return;
     if (!l.exists) { showLibMissingModal(l); return; }
@@ -891,12 +1047,11 @@ async function opDelete(t) {
 // ---------- 组标签操作：添加 / 修改 / 删除 ----------
 // 统一写回标签（一处实现，右键菜单与右侧详情共用）
 async function setGroupTags(g, names) {
-  const r = await window.api.libSetTags(state.libRoot, g.path, names);
-  if (r.error) { toast(r.error, true); return false; }
-  g.tags = r.group.tags || [];
+  const r = await window.api.libSetMeta(state.libRoot, g.rel, 'group', { tags: names });
+  if (r && r.error) { toast(r.error, true); return false; }
+  await loadLibrary(true);
   renderTagChips();
-  renderLibTree();
-  renderCurrentView();
+  refreshDetails();
   return true;
 }
 function groupTagNames(g) { return (g.tags || []).map(t => t.name); }
@@ -1250,25 +1405,45 @@ function showLibraryDetails(data) {
     ${detailRow('账本更新', fmtDate(data.updatedAt))}
     ${detailRow('路径', escapeHtml(data.root))}
   </div>
+  ${metaBlockHTML(data.rel || '', 'lib', data.name)}
   <button id="btn-open-lib" class="ghost-btn" style="margin-top:8px">打开文库目录</button>
   <button id="btn-lib-rescan" class="ghost-btn" style="margin-top:6px">重新扫描</button>
   ${reg ? `<div class="hint" style="margin-top:8px">点击阅览区中的大类卡片即可浏览其中的文件组。</div>` : ''}`;
   $('#btn-open-lib').onclick = () => window.api.showInFolder(data.root);
   $('#btn-lib-rescan').onclick = async () => { await loadLibrary(false); toast('已重新扫描'); };
+  bindMetaEdit(data.rel || '', 'lib', data.name);
 }
 
-// ---------- 标签筛选（左侧） ----------
+// ---------- 标签筛选（左侧）：标签 + 搜索层级多选 ----------
+// 候选标签来自账本里所有层级自己填的标签
 function allTags() {
   const map = new Map();
-  if (state.libData) for (const c of state.libData.categories)
-    for (const g of c.groups) for (const t of (g.tags || []))
-      if (!map.has(t.name)) map.set(t.name, t.color);
+  const mm = state.libData && state.libData.meta ? state.libData.meta : {};
+  for (const m of Object.values(mm))
+    for (const x of (m.tags || []))
+      if (x && x.name && !map.has(x.name)) map.set(x.name, x.color || metaTagColor(x.name));
   return map;
 }
-
+function renderTagLevels() {
+  const box = $('#tag-levels');
+  if (!box) return;
+  box.classList.toggle('hidden', state.searchMode !== 'tag');
+  box.querySelectorAll('input[data-level]').forEach(cb => {
+    cb.checked = state.tagLevels.has(cb.dataset.level);
+    cb.onchange = () => {
+      if (cb.checked) state.tagLevels.add(cb.dataset.level);
+      else state.tagLevels.delete(cb.dataset.level);
+      localStorage.setItem('fm_tag_levels', JSON.stringify([...state.tagLevels]));
+      applyFilterView();
+      renderCurrentView();
+      renderLibTree();
+    };
+  });
+}
 function renderTagChips() {
   const box = $('#lib-tag-chips');
   const tags = allTags();
+  renderTagLevels();
   // 只有「按标签」检索模式时才展示标签区
   box.classList.toggle('hidden', state.searchMode !== 'tag' || !tags.size);
   if (!tags.size) { box.innerHTML = ''; return; }
@@ -1284,9 +1459,32 @@ function renderTagChips() {
     renderCurrentView();
   });
 }
-
-function matchTag(g) {
-  return !state.libTagFilter || (g.tags || []).some(t => t.name === state.libTagFilter);
+// 左侧目录树 / 大类网格：用「含继承的有效标签」判断该组是否应出现
+function matchTag(g) { return !state.libTagFilter || tagHit(g.rel, state.libTagFilter); }
+// 按选中的层级收集结果；命中判定同样使用有效标签（组的标签也是组内文件的标签）
+function collectTagResults(tag) {
+  const out = [];
+  const D = state.libData;
+  if (!D || !tag) return out;
+  const lv = state.tagLevels;
+  if (lv.has('lib') && tagHit('', tag))
+    out.push({ kind: 'lib', name: D.name, path: D.root, icon: '📚',
+      sub: `${D.categories.length} 大类 · ${fmtSize(D.categories.reduce((s, c) => s + c.totalSize, 0))}` });
+  for (const c of D.categories) {
+    if (lv.has('cat') && tagHit(c.rel, tag))
+      out.push({ kind: 'cat', name: c.name, path: c.path, icon: '📁',
+        sub: `${c.groupCount} 组 · ${fmtSize(c.totalSize)}` });
+    for (const g of c.groups) {
+      if (lv.has('group') && tagHit(g.rel, tag))
+        out.push({ kind: 'group', name: g.displayName, path: g.path, icon: '🗂',
+          sub: `${g.fileCount} 文件 · ${fmtSize(g.totalSize)}` });
+      if (lv.has('file')) for (const f of g.files)
+        if (tagHit(f.rel, tag))
+          out.push({ kind: 'file', name: f.name, path: f.path, icon: ICONS[f.category] || '📃',
+            sub: `${g.displayName} · ${fmtSize(f.size)}` });
+    }
+  }
+  return out;
 }
 
 // ---------- 文库树（左） ----------
@@ -1376,9 +1574,11 @@ function showCategoryDetails(cat) {
     ${detailRow('总大小', fmtSize(cat.totalSize))}
     ${detailRow('路径', escapeHtml(cat.path))}
   </div>
+  ${metaBlockHTML(cat.rel, 'cat', cat.name)}
   <button id="btn-open-cat" class="ghost-btn" style="margin-top:8px">打开大类文件夹</button>
   <div class="hint" style="margin-top:8px">单击卡片看信息，双击进入该组</div>`;
   $('#btn-open-cat').onclick = () => window.api.showInFolder(cat.path);
+  bindMetaEdit(cat.rel, 'cat', cat.name);
 }
 
 // ---------- 搜索/分类筛选结果视图（中：文件平铺分页 + 右：统计） ----------
@@ -1390,34 +1590,53 @@ function getLibFiles() {
   return out;
 }
 
-let filterInfo = { list: [], kw: '', cat: '全部', tag: null };
+let filterInfo = { list: [], kw: '', cat: '全部', tag: null, levels: [], mode: 'plain' };
 function showFilterDetails() {
-  const { list, kw, cat, tag } = filterInfo;
+  const { list, kw, cat, tag, levels, mode } = filterInfo;
+  const byLevel = {};
+  for (const x of list) {
+    const k = mode === 'tag' ? x.kind : 'file';
+    byLevel[k] = (byLevel[k] || 0) + 1;
+  }
+  const levelStat = META_LEVELS.filter(l => byLevel[l.key]).map(l =>
+    detailRow(l.label, byLevel[l.key] + ' 个')).join('');
   const countByCat = {};
-  for (const x of list) countByCat[x.file.category] = (countByCat[x.file.category] || 0) + 1;
+  if (mode === 'plain') for (const x of list) countByCat[x.file.category] = (countByCat[x.file.category] || 0) + 1;
   const catStat = Object.entries(countByCat).map(([c, n]) => detailRow(ICONS[c] + ' ' + c, n + ' 个')).join('');
   $('#detail-body').innerHTML = `<div class="detail-rows">
-    ${detailRow('类型', '检索结果')}
+    ${detailRow('类型', mode === 'tag' ? '标签检索结果' : '检索结果')}
     ${kw ? detailRow('关键词', escapeHtml(kw)) : ''}
     ${cat !== '全部' ? detailRow('类型筛选', cat) : ''}
     ${tag ? detailRow('标签筛选', escapeHtml(tag)) : ''}
-    ${detailRow('文件总数', list.length + ' 个')}
-    ${detailRow('总大小', fmtSize(list.reduce((s, x) => s + x.file.size, 0)))}
+    ${mode === 'tag' ? detailRow('检索层级', levels.length ? levels.join('、') : '未选择层级') : ''}
+    ${detailRow(mode === 'tag' ? '结果总数' : '文件总数', list.length + ' 个')}
+    ${mode === 'plain' ? detailRow('总大小', fmtSize(list.reduce((s, x) => s + x.file.size, 0))) : ''}
   </div>
+  ${levelStat ? `<div class="box-title" style="padding:8px 0 4px">按层级</div><div class="detail-rows">${levelStat}</div>` : ''}
   ${catStat ? `<div class="box-title" style="padding:8px 0 4px">按类型</div><div class="detail-rows">${catStat}</div>` : ''}
-  <div class="hint" style="margin-top:8px">单击文件查看信息，双击预览；清空搜索框返回文库浏览</div>`;
+  <div class="hint" style="margin-top:8px">单击查看信息，双击进入；清空筛选条件返回文库浏览</div>`;
 }
 
 function showLibFilterView() {
   state.view = 'search';
   $('#btn-new-lib-inline').classList.add('hidden');
   const kw = state.libSearch.toLowerCase();
-  let list = getLibFiles();
-  if (state.libCatFilter !== '全部') list = list.filter(x => x.file.category === state.libCatFilter);
-  if (state.libTagFilter) list = list.filter(x => (x.group.tags || []).some(t => t.name === state.libTagFilter));
-  if (kw) list = list.filter(x => x.file.name.toLowerCase().includes(kw));
-
-  filterInfo = { list, kw, cat: state.libCatFilter, tag: state.libTagFilter };
+  const tag = state.libTagFilter;
+  let list, mode, levels;
+  if (tag) {
+    // 标签模式：按勾选的层级给出混合结果，命中口径为「含继承的有效标签」
+    mode = 'tag';
+    levels = META_LEVELS.filter(l => state.tagLevels.has(l.key)).map(l => l.label);
+    list = collectTagResults(tag);
+    if (kw) list = list.filter(x => x.name.toLowerCase().includes(kw));
+  } else {
+    mode = 'plain';
+    levels = [];
+    list = getLibFiles();
+    if (state.libCatFilter !== '全部') list = list.filter(x => x.file.category === state.libCatFilter);
+    if (kw) list = list.filter(x => x.file.name.toLowerCase().includes(kw));
+  }
+  filterInfo = { list, kw, cat: state.libCatFilter, tag, levels, mode };
 
   const pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
   if (state.libPageNum > pages) state.libPageNum = 1;
@@ -1426,9 +1645,20 @@ function showLibFilterView() {
 
   const conds = [state.libSearch ? `关键词“${state.libSearch}”` : null,
     state.libCatFilter !== '全部' ? `类型：${state.libCatFilter}` : null,
-    state.libTagFilter ? `标签：${state.libTagFilter}` : null].filter(Boolean).join(' + ');
-  $('#preview-name').textContent = `搜索结果${conds ? '：' + conds : ''} · ${list.length} 个文件`;
-  const tiles = slice.map((x, i) => `
+    tag ? `标签：${tag}` : null,
+    mode === 'tag' ? `层级：${levels.length ? levels.join('/') : '未选择'}` : null].filter(Boolean).join(' + ');
+  $('#preview-name').textContent = `搜索结果${conds ? '：' + conds : ''} · ${list.length} 项`;
+  const tiles = slice.map((x, i) => {
+    if (mode === 'tag') return `
+    <div class="tile f-tile${selClass(x.path)}" data-i="${i}"${cardDataAttr(x.kind, x.path, x.name)}>
+      <div class="t-slot with-icon"><span class="t-icon">${x.icon}</span></div>
+      <div class="t-foot">
+        <div class="t-name" title="${escapeHtml(x.name)}">${escapeHtml(x.name)}</div>
+        <div class="t-size">${escapeHtml(x.sub)}</div>
+      </div>
+      <span class="tile-level">${escapeHtml(KIND_LABEL[x.kind] || '')}</span>
+    </div>`;
+    return `
     <div class="tile f-tile${selClass(x.file.path)}" data-i="${i}"${cardDataAttr('file', x.file.path, x.file.name)}>
       <div class="t-slot with-icon"><span class="t-icon">${ICONS[x.file.category] || '📃'}</span></div>
       <div class="t-foot">
@@ -1436,17 +1666,19 @@ function showLibFilterView() {
         <div class="t-size">${escapeHtml(x.group.displayName)} · ${fmtSize(x.file.size)}</div>
       </div>
       ${OPS_HTML}
-    </div>`).join('');
+    </div>`;
+  }).join('');
   const body = $('#preview-body');
   body.innerHTML = list.length
     ? `<div class="grid-wrap"><div class="tile-grid">${tiles}</div>${pagerHTML(page, pages)}</div>`
-    : `<div class="preview-placeholder"><div class="big">🔍</div><div>没有匹配的文件</div><div class="empty-sub">换个关键词或类型试试</div></div>`;
+    : `<div class="preview-placeholder"><div class="big">🔍</div><div>没有匹配的结果</div><div class="empty-sub">换个标签或在左侧勾选更多搜索层级试试</div></div>`;
 
   bindPager(body, showLibFilterView);
   refreshDetails();
   navCommit();
 }
 
+// ---------- 组视图（中：文件平铺 + 右：组详情） ----------
 // ---------- 组视图（中：文件平铺 + 右：组详情含标签） ----------
 function showGroupPreview(g, cat) {
   state.view = 'group';
@@ -1480,13 +1712,8 @@ function showGroupPreview(g, cat) {
 }
 
 
-// 组详情（右）：信息 + 标签编辑 + 预览图
+// 组详情（右）：统计信息 + 3 类维护信息（含上级继承）+ 预览图操作
 function showGroupDetails(g) {
-  const tags = g.tags || [];
-  const tagHtml = tags.length
-    ? `<div class="detail-tags">${tags.map(t =>
-        `<span class="tag-chip mini" style="--tag-c:${t.color}" data-rename="${escapeHtml(t.name)}" title="点击修改名称">${escapeHtml(t.name)}<i class="tag-x" data-x="${escapeHtml(t.name)}" title="删除">✕</i></span>`).join('')}</div>`
-    : '<div class="hint">暂无标签，可在下方添加</div>';
   const fileList = g.files.slice(0, 30).map(f =>
     `<div class="history-item" style="cursor:default">
       <span>${ICONS[f.category] || '📃'}</span><span class="h-name">${escapeHtml(f.name)}</span>
@@ -1500,51 +1727,17 @@ function showGroupDetails(g) {
     ${detailRow('总大小', fmtSize(g.totalSize))}
     ${detailRow('修改时间', fmtDate(g.mtime))}
     ${detailRow('所属大类', escapeHtml(parentName(g.path)))}
-    ${detailRow('预览图', g.cover ? escapeHtml(baseName(g.cover)) : '自动（组内第一张图片）')}
     ${detailRow('路径', escapeHtml(g.path))}
   </div>
+  ${metaBlockHTML(g.rel, 'group', g.displayName)}
   <button id="btn-open-group" class="ghost-btn" style="margin-top:8px">打开组文件夹</button>
-  <div class="box-title" style="padding:10px 0 4px">标签</div>
-  ${tagHtml}
-  <div class="tag-add-row">
-    <input id="tag-input" placeholder="输入标签，回车添加" spellcheck="false">
-    <button id="btn-add-tag">添加</button>
-  </div>
-  <button id="btn-set-cover" class="ghost-btn" style="margin-top:8px">设置预览图</button>
+  <button id="btn-set-cover" class="ghost-btn" style="margin-top:6px">设置预览图</button>
   ${g.files.length ? `<div class="box-title" style="padding:10px 0 4px">组内文件（前 ${Math.min(30, g.files.length)} 个）</div>
     <div style="background:var(--panel-2);border:1px solid var(--border);border-radius:8px;max-height:36%;overflow-y:auto">${fileList}</div>`
     : '<div class="hint" style="margin-top:10px">组内暂无文件，点击「添加文件到组」</div>'}`;
 
   $('#btn-open-group').onclick = () => window.api.showInFolder(g.path);
-
-  const commitTags = async (names) => { await setGroupTags(g, names); };
-  const addTag = () => {
-    const v = $('#tag-input').value.trim();
-    if (!v) return;
-    $('#tag-input').value = '';
-    commitTags([...tags.map(t => t.name), v]);
-  };
-  $('#btn-add-tag').onclick = addTag;
-  bindEnter($('#tag-input'), addTag);          // 回车添加（拼音选字时不触发）
-  const box = $('#detail-body');
-  box.querySelectorAll('[data-x]').forEach(x => x.onclick = ev => {
-    ev.stopPropagation();
-    const name = x.dataset.x;
-    showModal('删除标签', `<div class="hint">确定从「<b>${escapeHtml(g.displayName)}</b>」删除标签「<b>${escapeHtml(name)}</b>」？</div>`, async () => {
-      commitTags(tags.map(t => t.name).filter(n => n !== name));
-    }, '删除');
-  });
-  box.querySelectorAll('[data-rename]').forEach(ch => ch.onclick = ev => {
-    if (ev.target.classList.contains('tag-x')) return;
-    const old = ch.dataset.rename;
-    showModal('修改标签', `
-      <label class="field-label">标签名称</label>
-      <input id="m-input" value="${escapeHtml(old)}" spellcheck="false">`, async () => {
-      const v = $('#m-input').value.trim();
-      if (!v || v === old) return;
-      commitTags(tags.map(t => t.name === old ? v : t.name));
-    }, '保存');
-  });
+  bindMetaEdit(g.rel, 'group', g.displayName);
   $('#btn-set-cover').onclick = async () => {
     const files = await pickFilesSafe();
     if (!files || !files.length) return;
@@ -1681,6 +1874,252 @@ $('#btn-add-to-group').onclick = async () => {
     renderBreadcrumb();
   }
 };
+
+// ---------- 批量添加：单页表单（5 项依次排列） ----------
+// 表单状态独立于 DOM：系统对话框不可用时内置选择器会临时占用通用弹窗，
+// 关闭后重新渲染即可恢复，已填内容不会丢失。
+const BA_TAG_COLORS = META_TAG_COLORS;
+function batchTagColor(name) { return metaTagColor(name); }
+function batchTagChipsHtml(tags) {
+  return tags.map(t => `<span class="tag-chip mini" style="--tag-c:${batchTagColor(t)}">${escapeHtml(t)}<i class="tag-x" data-ba-x="${escapeHtml(t)}" title="移除">✕</i></span>`).join('');
+}
+
+function batchLocRow(b, loc, text, kindText, cls) {
+  const sel = b.loc && b.loc.level === loc.level && b.loc.path === loc.path ? ' picked' : '';
+  return `<div class="ip-item ba-loc ${cls}${sel}" data-level="${loc.level}" data-path="${escapeHtml(loc.path)}" data-lib="${escapeHtml(loc.libPath)}" data-cat="${escapeHtml(loc.catName || '')}" data-label="${escapeHtml(loc.label)}">${text}<span class="ba-loc-tag">${kindText}</span></div>`;
+}
+function batchLocHTML(b) {
+  const rows = [];
+  for (const lib of b.locations) {
+    rows.push(batchLocRow(b,
+      { level: 'lib', path: lib.path, libPath: lib.path, catName: '', label: lib.name },
+      `📚 ${escapeHtml(lib.name)}`, '整个文库', 'ba-loc-lib'));
+    for (const c of lib.categories) {
+      const catLabel = `${lib.name} / ${c.name}`;
+      rows.push(batchLocRow(b,
+        { level: 'cat', path: c.path, libPath: lib.path, catName: c.name, label: catLabel },
+        `📁 ${escapeHtml(c.name)}`, '大类', 'ba-loc-cat'));
+      for (const g of c.groups) {
+        rows.push(batchLocRow(b,
+          { level: 'group', path: g.path, libPath: lib.path, catName: c.name, label: `${catLabel} / ${g.displayName}` },
+          `🗂 ${escapeHtml(g.displayName)}`, '组', 'ba-loc-group'));
+      }
+    }
+  }
+  return rows.length ? rows.join('')
+    : '<div class="hint" style="padding:8px">还没有可用文库，请先在左侧「新建」一个</div>';
+}
+function batchCatOptions(b) {
+  const lib = b.locations.find(l => l.path === b.loc.libPath);
+  const cats = lib ? lib.categories : [];
+  return cats.map(c => `<option value="${escapeHtml(c.name)}"${b.catChoice === c.name ? ' selected' : ''}>${escapeHtml(c.name)}</option>`).join('')
+    + `<option value="__new__"${b.catChoice === '__new__' ? ' selected' : ''}>＋ 新建大类…</option>`;
+}
+function suggestBatchGroupName(b) {
+  if (b.sources.length === 1) {
+    const n = baseName(b.sources[0]).replace(/\.[^./\\]+$/, '');
+    if (n) return n;
+  }
+  const d = new Date(), p = x => String(x).padStart(2, '0');
+  return `批量导入_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`;
+}
+
+function renderBatchForm() {
+  const b = batchState;
+  if (!b) return;
+  const needGroup = b.loc && b.loc.level !== 'group';
+  const srcHTML = b.sources.length
+    ? b.sources.map((p, i) => `<div class="ba-item"><span>📄</span><span class="ba-name" title="${escapeHtml(p)}">${escapeHtml(baseName(p))}</span><span class="ba-path" title="${escapeHtml(p)}">${escapeHtml(p)}</span><span class="ba-x" data-ba-src="${i}" title="移除">✕</span></div>`).join('')
+    : '<div class="hint" style="padding:6px">尚未选择。可反复点击「选择文件」/「选择文件夹」累加。</div>';
+  const html = `
+    <div class="ba-sec">
+      <div class="ba-sec-head"><span class="ba-num">1</span>待添加的文件（文件夹或多个文件）</div>
+      <div class="ba-tools">
+        <button id="ba-pick-files" type="button">选择文件（可多选）</button>
+        <button id="ba-pick-folder" type="button">选择文件夹</button>
+        <button id="ba-clear" type="button">清空</button>
+      </div>
+      <div class="ba-list">${srcHTML}</div>
+      <div class="hint">共 ${b.sources.length} 项。选择文件夹时会递归展开其中所有文件（跳过隐藏文件），平铺放入目标组；目标文库内部的文件会被跳过，避免重复复制。</div>
+    </div>
+
+    <div class="ba-sec">
+      <div class="ba-sec-head"><span class="ba-num">2</span>添加到哪个位置（文件库 / 大类 / 组）</div>
+      <div class="ba-loc-list">${batchLocHTML(b)}</div>
+      <div class="ba-summary">当前位置：<b>${b.loc ? escapeHtml(b.loc.label) : '尚未选择'}</b></div>
+      ${needGroup ? `
+        <label class="field-label">新组名称（留空自动命名：${escapeHtml(suggestBatchGroupName(b))}）</label>
+        <input id="ba-group-name" placeholder="留空则自动命名" value="${escapeHtml(b.groupName)}" spellcheck="false">
+        ${b.loc.level === 'lib' ? `
+          <label class="field-label">归入大类</label>
+          <select id="ba-cat">${batchCatOptions(b)}</select>
+          ${b.catChoice === '__new__' ? `<input id="ba-new-cat" placeholder="输入新大类名称" value="${escapeHtml(b.newCatName)}" spellcheck="false">` : ''}
+        ` : ''}
+        <div class="hint">选「整个文库」或「大类」时会自动新建一个组存放本批文件；选「组」则直接加入该组。</div>
+      ` : '<div class="hint">本批文件会直接复制进所选的组（原文件保持不变）。</div>'}
+    </div>
+
+    <div class="ba-sec">
+      <div class="ba-sec-head"><span class="ba-num">3</span>本批文件的作者（保存到组）</div>
+      <input id="ba-author" placeholder="例如：尾田荣一郎（留空则不填写）" value="${escapeHtml(b.author)}" spellcheck="false">
+      <div class="hint">作为本批所属「组」的作者保存，组内文件通过继承显示；往同一组反复添加会合并保留，不会互相覆盖。</div>
+    </div>
+
+    <div class="ba-sec">
+      <div class="ba-sec-head"><span class="ba-num">4</span>本批文件的标签（可添加多个）</div>
+      <div class="ba-row">
+        <input id="ba-tag-input" placeholder="输入标签后回车，或点「添加」" spellcheck="false">
+        <button id="ba-tag-add" type="button">添加</button>
+      </div>
+      <div class="ba-chips">${b.tags.length ? batchTagChipsHtml(b.tags) : '<span class="hint">尚未添加标签</span>'}</div>
+      <div class="hint">作为本批所属「组」的标签保存，组内文件自动继承；左侧「按标签」检索可指定搜索层级。</div>
+    </div>
+
+    <div class="ba-sec">
+      <div class="ba-sec-head"><span class="ba-num">5</span>本批文件的来源（保存到组）</div>
+      <input id="ba-source" placeholder="例如：XX 网站 / 扫描自实体书（留空则不填写）" value="${escapeHtml(b.source)}" spellcheck="false">
+      <div class="hint">作为本批所属「组」的来源保存，组内文件通过继承显示。</div>
+    </div>`;
+  showModal('批量添加', html, submitBatch, '开始添加', () => { batchState = null; },
+    { wide: true, enterOK: false, noFocus: true });
+  bindBatchEvents();
+}
+
+function bindBatchEvents() {
+  const b = batchState;
+  const body = $('#modal-body');
+  const on = (sel, fn) => { const el = $(sel); if (el) el.onclick = fn; };
+  on('#ba-pick-files', async () => {
+    const picked = await pickFilesSafe();
+    if (picked && picked.length) for (const p of picked) if (!b.sources.includes(p)) b.sources.push(p);
+    if (batchState) renderBatchForm();
+  });
+  on('#ba-pick-folder', async () => {
+    const p = await pickFolderSafe();
+    if (p && !b.sources.includes(p)) b.sources.push(p);
+    if (batchState) renderBatchForm();
+  });
+  on('#ba-clear', () => { b.sources = []; renderBatchForm(); });
+  body.querySelectorAll('[data-ba-src]').forEach(el => el.onclick = () => {
+    b.sources.splice(parseInt(el.dataset.baSrc), 1);
+    renderBatchForm();
+  });
+  body.querySelectorAll('.ba-loc').forEach(el => el.onclick = () => {
+    b.loc = {
+      level: el.dataset.level, path: el.dataset.path, libPath: el.dataset.lib,
+      catName: el.dataset.cat || '', label: el.dataset.label
+    };
+    if (b.loc.level === 'lib') {
+      const lib = b.locations.find(l => l.path === b.loc.libPath);
+      b.catChoice = lib && lib.categories.length ? lib.categories[0].name : '__new__';
+    }
+    renderBatchForm();
+  });
+  const bindVal = (sel, key) => {
+    const el = $(sel);
+    if (el) el.addEventListener('input', () => { b[key] = el.value; });
+  };
+  bindVal('#ba-author', 'author');
+  bindVal('#ba-source', 'source');
+  bindVal('#ba-group-name', 'groupName');
+  bindVal('#ba-new-cat', 'newCatName');
+  const catSel = $('#ba-cat');
+  if (catSel) catSel.onchange = () => { b.catChoice = catSel.value; renderBatchForm(); };
+  const addTag = () => {
+    const inp = $('#ba-tag-input');
+    if (!inp) return;
+    const v = inp.value.trim();
+    if (!v) return;
+    if (!b.tags.includes(v)) b.tags.push(v);
+    b.focusTag = true;
+    renderBatchForm();
+  };
+  on('#ba-tag-add', addTag);
+  const tagInp = $('#ba-tag-input');
+  if (tagInp) bindEnter(tagInp, addTag);   // 回车添加标签（输入法选字时不触发）
+  body.querySelectorAll('[data-ba-x]').forEach(el => el.onclick = () => {
+    b.tags = b.tags.filter(t => t !== el.dataset.baX);
+    renderBatchForm();
+  });
+  if (b.focusTag) {
+    b.focusTag = false;
+    const inp = $('#ba-tag-input');
+    if (inp) setTimeout(() => inp.focus(), 20);
+  }
+}
+
+async function submitBatch() {
+  const b = batchState;
+  if (!b || b.busy) return true;
+  const grab = (sel, key) => { const el = $(sel); if (el) b[key] = el.value; };
+  grab('#ba-author', 'author'); grab('#ba-source', 'source');
+  grab('#ba-group-name', 'groupName'); grab('#ba-new-cat', 'newCatName');
+  if (!b.sources.length) { toast('请先选择待添加的文件或文件夹', true); return true; }
+  if (!b.loc) { toast('请选择添加到的位置', true); return true; }
+  const target = {
+    level: b.loc.level,
+    path: b.loc.path,
+    categoryName: b.loc.catName || '',
+    groupName: (b.groupName || '').trim() || suggestBatchGroupName(b)
+  };
+  if (b.loc.level === 'lib') {
+    if (b.catChoice === '__new__') {
+      const n = (b.newCatName || '').trim();
+      if (!n) { toast('请填写新建大类的名称', true); return true; }
+      target.newCategoryName = n;
+      target.categoryName = n;
+    } else if (b.catChoice) target.categoryName = b.catChoice;
+  }
+  b.busy = true;
+  const okBtn = $('#modal-ok');
+  okBtn.disabled = true;
+  okBtn.textContent = '正在添加…';
+  let r;
+  try {
+    r = await window.api.libBatchAdd({
+      root: b.loc.libPath, target, sources: b.sources,
+      author: b.author, tags: b.tags, source: b.source
+    });
+  } catch (err) {
+    b.busy = false; okBtn.disabled = false; okBtn.textContent = '开始添加';
+    toast('批量添加失败：' + err.message, true);
+    return true;
+  }
+  b.busy = false;
+  okBtn.disabled = false;
+  okBtn.textContent = '开始添加';
+  if (r.error) { toast(r.error, true); return true; }
+  toast(`已添加 ${r.done} 个文件${r.failed.length ? `，${r.failed.length} 个失败` : ''}${r.skipped ? `，跳过 ${r.skipped} 个` : ''}`);
+  const root = r.root, groupPath = r.groupPath;
+  batchState = null;
+  if (root !== state.libRoot) await selectLibrary(root);
+  else await loadLibrary(true);
+  const g = state.libData ? findGroup(state.libData, groupPath) : null;
+  if (g) {
+    state.libExpanded.add(parentName(g.path));
+    gotoGroup(g);                 // 右侧直接显示本组文件的批次信息
+  } else {
+    renderLibTree();
+    renderCurrentView();
+  }
+  return;
+}
+
+async function openBatchAdd() {
+  const fresh = {
+    sources: [], locations: [], loc: null,
+    groupName: '', catChoice: '', newCatName: '',
+    author: '', tags: [], source: '', busy: false, focusTag: false
+  };
+  try { fresh.locations = await window.api.libLocations(); } catch { fresh.locations = []; }
+  if (!fresh.locations.length) { toast('请先创建或选择一个可用的文库', true); return; }
+  const cur = fresh.locations.find(l => l.path === state.libRoot) || fresh.locations[0];
+  fresh.loc = { level: 'lib', path: cur.path, libPath: cur.path, catName: '', label: cur.name };
+  fresh.catChoice = cur.categories.length ? cur.categories[0].name : '__new__';
+  batchState = fresh;
+  renderBatchForm();
+}
+$('#btn-batch-add').onclick = openBatchAdd;
 
 // ---------- 阅览区全屏 ----------
 const previewPanel = $('#preview-panel');

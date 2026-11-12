@@ -5,7 +5,7 @@
   --border: #e2e5ea;
   --text: #23262b;
   --text-sub: #6b7280;
-  --text-weak: var(--text-weak);
+  --text-weak: #9aa1ad;
   --accent: #2f6fed;
   --accent-soft: #eaf1fe;
   --hover: #f0f3f8;
@@ -54,7 +54,7 @@ button { font-family: inherit; }
 /* ---------- 三栏主体（左 / 中 / 右） ---------- */
 #main-row { flex: 1; display: flex; min-height: 0; }
 
-/* ========== v1.5.0 左侧工作区（分区式布局） ========== */
+/* ========== 左侧工作区（分区式布局） ========== */
 #left-panel {
   width: var(--left-w);
   flex: 0 0 var(--left-w);
@@ -682,7 +682,7 @@ button { font-family: inherit; }
 /* 弹窗按钮：取消=次要（描边），确定=主要（蓝底白字）。
    注意：这里必须写成「#modal-buttons button#modal-ok」——
    纯 #modal-ok 的优先级低于 #modal-buttons button，会被后者的白底覆盖，
-   导致白字白底、看起来像"按钮上没有文字"（v1.7.1 修正） */
+   导致白字白底、看起来像"按钮上没有文字" */
 /* 弹窗底部的次要操作（如「不再保留」），视觉上弱化于主按钮 */
 .modal-extra-actions {
   margin-top: 14px;
@@ -740,7 +740,7 @@ button { font-family: inherit; }
 }
 #toast.error { background: var(--danger); }
 
-/* ========== v1.3.0 文库：标签 / 预览图网格 / 分页 ========== */
+/* ========== 文库：标签 / 预览图网格 / 分页 ========== */
 /* 标签筛选 chips（左侧） */
 .tag-chips {
   display: flex; flex-wrap: wrap; gap: 4px;
@@ -815,7 +815,7 @@ button { font-family: inherit; }
 .pager button:hover:not(:disabled) { background: var(--hover); }
 .pager button:disabled { opacity: .4; cursor: default; }
 
-/* ========== v1.3.1 内置文件/文件夹选择器 ========== */
+/* ========== 内置文件/文件夹选择器 ========== */
 .ip-path-row {
   display: flex; align-items: center; gap: 8px;
   margin-bottom: 6px;
@@ -849,7 +849,7 @@ button { font-family: inherit; }
 .ip-item:hover { background: var(--hover); }
 .ip-item.picked { background: var(--accent); color: #fff; }
 
-/* ========== v1.5.0 文库总览 / 文库首页 ========== */
+/* ========== 文库总览 / 文库首页 ========== */
 /* 网格容器：撑满阅览区高度，卡片从上往下排列 */
 .grid-wrap { width: 100%; align-self: stretch; }
 
@@ -915,3 +915,114 @@ button { font-family: inherit; }
 .lib-switch-item { justify-content: flex-start; gap: 8px; }
 .lib-switch-item .ls-path { font-size: var(--fs-xs); color: var(--text-weak); }
 .ip-item.picked .ls-path { color: rgba(255, 255, 255, .8); }
+
+/* ---------- 批量添加：左侧按钮 / 宽屏弹窗 / 单页表单 ---------- */
+.lp-btn-row .batch-btn {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: #bfd5fb;
+  font-weight: var(--fw-medium);
+}
+.lp-btn-row .batch-btn:hover { background: #dce9fd; border-color: var(--accent); }
+
+#modal.wide {
+  width: 560px;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+}
+#modal.wide #modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  margin-bottom: 14px;
+  padding-right: 4px;
+}
+#modal.wide #modal-buttons { flex: 0 0 auto; }
+#modal-buttons button:disabled { opacity: .6; cursor: default; filter: none; }
+
+.ba-sec {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 9px 12px 11px;
+  margin-bottom: 9px;
+  background: var(--panel-2);
+}
+.ba-sec-head {
+  display: flex; align-items: center; gap: 7px;
+  font-size: var(--fs-md); font-weight: var(--fw-strong);
+  color: var(--text); margin-bottom: 7px;
+}
+.ba-sec .hint { margin-top: 6px; }
+.ba-num {
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: 0 0 18px; width: 18px; height: 18px;
+  border-radius: 50%; background: var(--accent); color: #fff;
+  font-size: var(--fs-xs); font-weight: var(--fw-strong);
+}
+.ba-tools { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 7px; }
+.ba-tools button, .ba-row button {
+  padding: 5px 10px; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--panel); color: var(--text);
+  cursor: pointer; font-size: var(--fs-sm); white-space: nowrap;
+}
+.ba-tools button:hover, .ba-row button:hover { background: var(--hover); }
+.ba-list {
+  max-height: 118px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 7px;
+  background: var(--panel); padding: 3px;
+}
+.ba-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 6px; border-radius: 5px; font-size: var(--fs-sm);
+}
+.ba-item:hover { background: var(--hover); }
+.ba-item .ba-name { flex: 0 1 auto; max-width: 42%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ba-item .ba-path { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-xs); color: var(--text-weak); }
+.ba-item .ba-x { cursor: pointer; color: var(--text-weak); padding: 0 4px; }
+.ba-item .ba-x:hover { color: var(--danger); }
+.ba-loc-list {
+  height: 166px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 7px;
+  background: var(--panel-2); padding: 3px;
+}
+.ba-loc { font-size: var(--fs-sm); padding: 4px 8px; }
+.ba-loc-cat { padding-left: 22px; }
+.ba-loc-group { padding-left: 38px; }
+.ba-loc .ba-loc-tag { margin-left: auto; font-size: var(--fs-xs); opacity: .7; }
+.ba-summary { font-size: var(--fs-sm); color: var(--text-sub); margin-top: 6px; line-height: 1.6; }
+.ba-row { display: flex; gap: 6px; align-items: center; }
+#modal-body .ba-row input { flex: 1 1 auto; width: auto; min-width: 0; margin-top: 0; }
+.ba-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.ba-chips .tag-chip { cursor: default; }
+
+/* ---------- 标签检索：搜索层级多选 ---------- */
+.tag-levels {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: 5px 10px; margin: 2px 0 7px; font-size: var(--fs-xs);
+}
+.tag-levels.hidden { display: none; }
+.tag-levels .tl-title { flex: 0 0 100%; color: var(--text-sub); }
+.tag-levels label {
+  display: inline-flex; align-items: center; gap: 3px;
+  color: var(--text); cursor: pointer; user-select: none;
+}
+.tag-levels input[type="checkbox"] { margin: 0; accent-color: var(--accent); cursor: pointer; }
+
+/* ---------- 详情：维护信息（作者 / 标签 / 来源） ---------- */
+.meta-empty { color: var(--text-sub); opacity: .8; }
+.meta-from {
+  display: inline-block; margin-left: 4px; padding: 0 4px;
+  border-radius: 4px; background: var(--accent-soft); color: var(--accent);
+  font-size: 10px; font-style: normal; vertical-align: middle;
+}
+.tag-chip.mini .meta-from { background: rgba(255, 255, 255, .28); color: inherit; }
+#detail-body > .detail-tags { padding: 2px 0 6px; }
+
+/* ---------- 检索结果卡片：层级角标 ---------- */
+.tile-level {
+  position: absolute; top: 6px; right: 6px; z-index: 2;
+  padding: 1px 5px; border-radius: 4px;
+  background: rgba(0, 0, 0, .55); color: #fff;
+  font-size: 10px; pointer-events: none;
+}

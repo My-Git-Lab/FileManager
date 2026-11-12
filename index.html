@@ -49,11 +49,21 @@
           </div>
           <div id="cat-chips"></div>
           <div id="lib-tag-chips" class="tag-chips hidden"></div>
+          <div id="tag-levels" class="tag-levels hidden">
+            <span class="tl-title">搜索层级（可多选）</span>
+            <label><input type="checkbox" data-level="lib">文库</label>
+            <label><input type="checkbox" data-level="cat">大类</label>
+            <label><input type="checkbox" data-level="group">组</label>
+            <label><input type="checkbox" data-level="file">文件</label>
+          </div>
         </section>
 
         <!-- 快捷操作 -->
         <section class="lp-sec">
           <div class="lp-sec-title">快捷操作</div>
+          <div class="lp-btn-row">
+            <button id="btn-batch-add" class="batch-btn" title="按批次导入文件或整个文件夹，并统一填写作者 / 标签 / 来源">批量添加</button>
+          </div>
           <div class="lp-btn-row">
             <button id="btn-new-group" class="primary-btn">新建组</button>
             <button id="btn-add-to-group">添加文件</button>
