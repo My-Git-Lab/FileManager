@@ -1458,6 +1458,36 @@ ipcMain.handle('lib:batchAdd', async (e, payload) => {
   return { ok: true, root, groupPath, done, failed, skipped: expanded.skipped };
 });
 
+// Windows 的 NTFS 不区分大小写：仅改大小写时 existsSync(新名) 也会返回 true，
+// 若直接当成"同名冲突"拦下，「小说test → 小说Test」会被误报成"目标位置已存在同名"。
+// 比较路径时统一 resolve（顺带兼容正反斜杠的写法差异）。
+function sameFsPath(a, b) {
+  try { return isSamePath(path.resolve(a), path.resolve(b)); } catch { return false; }
+}
+function renameErrorMessage(err) {
+  const code = err && err.code;
+  if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES')
+    return '无法改名：目录或文件正被其他程序占用（常见于资源管理器窗口、杀毒软件或正在预览的文件），关闭后重试即可';
+  if (code === 'ENOENT') return '无法改名：原路径已不存在，请刷新后重试';
+  return '改名失败：' + (err && err.message ? err.message : String(err));
+}
+// 部分 Windows 环境不接受"只改大小写"的一次 rename，需要经一个临时名中转。
+// 非大小写改动 / 非 Windows 一律不中转，失败原样抛出。
+async function renamePath(oldP, newP) {
+  try { await fs.rename(oldP, newP); return; }
+  catch (err) {
+    if (oldP === newP || !sameFsPath(oldP, newP) || process.platform !== 'win32') throw err;
+    const staging = path.join(path.dirname(oldP),
+      '.fm_case_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8));
+    await fs.rename(oldP, staging);
+    try { await fs.rename(staging, newP); }
+    catch (err2) {
+      await fs.rename(staging, oldP).catch(() => {});
+      throw err2;
+    }
+  }
+}
+
 // ---------- 重命名（文库 / 大类 / 组 / 文件） ----------
 // 组名只改"名字"部分，保留 日期_序号_ 前缀；文件保留扩展名
 ipcMain.handle('lib:rename', async (e, { kind, target, newName }) => {
@@ -1480,17 +1510,32 @@ ipcMain.handle('lib:rename', async (e, { kind, target, newName }) => {
   }
   const newPath = path.join(dir, newBase);
   if (newPath === target) return { ok: true, path: newPath, name: safe };
-  if (fss.existsSync(newPath)) return { error: '目标位置已存在同名：' + newBase };
+  // 只改大小写时，新路径"看起来已存在"其实就是它自己，不算冲突
+  if (!sameFsPath(newPath, target) && fss.existsSync(newPath))
+    return { error: '目标位置已存在同名：' + newBase };
   try {
-    await fs.rename(target, newPath);
-    // 改名后同步账本里的层级元数据键（相对路径变了）
-    if (kind !== 'lib' && kind !== 'library') await rewriteMeta(target, newPath, kind !== 'file');
-  } catch (err) { return { error: err.message }; }
+    await renamePath(target, newPath);
+  } catch (err) { return { error: renameErrorMessage(err) }; }
+  // 改名后同步账本里的层级元数据键（相对路径变了）。元数据同步失败不该让改名变成"失败"
+  if (kind !== 'lib' && kind !== 'library') {
+    try { await rewriteMeta(target, newPath, kind !== 'file'); }
+    catch (err) { console.log('[重命名] 元数据同步失败：' + err.message); }
+  }
   // 文库改名：同步更新注册表与账本里的名称/路径
   if (kind === 'lib' || kind === 'library') {
     const reg = readRegistry();
-    const lib = reg.libraries.find(l => l.path === target);
-    if (lib) { lib.path = newPath; lib.name = safe; writeRegistry(reg); }
+    const lib = reg.libraries.find(l => sameFsPath(l.path, target));
+    if (!lib) {
+      // 登记里找不到这条，继续下去会让文库变成"已丢失"；把目录改回去更安全
+      await renamePath(newPath, target).catch(() => {});
+      return { error: '未找到该文库的登记信息，已撤销改名（可先「重新定位」该文库再试）' };
+    }
+    try {
+      lib.path = newPath; lib.name = safe; writeRegistry(reg);
+    } catch (err) {
+      await renamePath(newPath, target).catch(() => {});
+      return { error: '文库登记信息写入失败，已撤销改名：' + err.message };
+    }
     try {
       const lp = path.join(newPath, '.library-index.json');
       const led = await readLedger(lp, newPath);
@@ -1548,6 +1593,7 @@ function createWindow() {
     height: 820,
     minWidth: 900,
     minHeight: 600,
+    fullscreenable: true,
     title: `本地文件管理器 v${app.getVersion()}`,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -1575,12 +1621,21 @@ function createWindow() {
     console.log('[安全] 已拦截新窗口请求：' + url);
     return { action: 'deny' };
   });
-  // 本地文件管理器不需要摄像头、麦克风、定位、通知、剪贴板读取等任何权限
+  // 本地文件管理器不需要摄像头、麦克风、定位、通知、剪贴板读取等权限。
+  // 但 v0.2.1 把权限一刀切 cb(false)，连 fullscreen 也拒了 —— <video> 的原生
+  // 全屏按钮正是通过 Fullscreen API 请求 fullscreen 权限，结果视频能播放却不能全屏。
+  // 这里只放行 fullscreen 这一项，其余仍全部拒绝；最坏情况下渲染层被注入也只是
+  // 多了「让窗口全屏」的能力，拿不到摄像头 / 文件 / 外链等任何敏感权限。
   const ses = win.webContents.session;
+  const allowPermission = (permission) => permission === 'fullscreen';
   if (typeof ses.setPermissionRequestHandler === 'function')
-    ses.setPermissionRequestHandler((wc, permission, cb) => cb(false));
+    ses.setPermissionRequestHandler((wc, permission, cb) => cb(allowPermission(permission)));
   if (typeof ses.setPermissionCheckHandler === 'function')
-    ses.setPermissionCheckHandler(() => false);
+    ses.setPermissionCheckHandler((wc, permission) => allowPermission(permission));
+  // HTML 全屏时让窗口一起进入系统级全屏，视频才会真正占满屏幕；
+  // 按 ESC 退出全屏时同步恢复窗口（桌面端 Electron 不会自动做这一步）。
+  win.on('enter-html-full-screen', () => { if (!win.isFullScreen()) win.setFullScreen(true); });
+  win.on('leave-html-full-screen', () => { if (win.isFullScreen()) win.setFullScreen(false); });
 
   win.loadFile('index.html');
 }

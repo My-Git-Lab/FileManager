@@ -466,6 +466,7 @@ function renderCurrentView() {
     case 'search': showLibFilterView(); break;
     default: showLibrariesView();
   }
+  updateFileNavButtons();
 }
 function libFilterActive() {
   return state.libSearch !== '' || state.libCatFilter !== '全部' || !!state.libTagFilter;
@@ -522,11 +523,70 @@ function gotoFile(f) {
   showDetails(f);
 }
 
+// ---------- 文件连续浏览（上一个 / 下一个） ----------
+// 按「用户是从哪份列表点进来的」决定翻页顺序：检索结果 > 当前组 > 整个文库。
+// 这样在组内翻页不会突然跳到别的大类，在检索结果里翻页也保持结果顺序。
+function previewFilesForNav() {
+  const cur = state.libPreviewFile;
+  if (!cur || cur.isDir) return [];
+  const resolve = (x) => {
+    if (!x) return null;
+    if (x.file) return x.file;
+    if (x.path) return findLibFile(x.path);
+    return null;
+  };
+  const has = (list) => list.some(f => f.path === cur.path);
+  if (state.view === 'search' && Array.isArray(filterInfo.list)) {
+    const list = filterInfo.list.map(resolve).filter(f => f && f.path && !f.isDir);
+    if (has(list)) return list;
+  }
+  const g = state.libSel?.type === 'group' ? state.libSel.data : null;
+  if (g && Array.isArray(g.files)) {
+    const list = g.files.filter(f => f && f.path && !f.isDir);
+    if (has(list)) return list;
+  }
+  const all = getLibFiles().map(x => x.file).filter(f => f && f.path && !f.isDir);
+  if (has(all)) return all;
+  return [cur];
+}
+function updateFileNavButtons() {
+  const prev = $('#btn-prev-file'), next = $('#btn-next-file');
+  if (!prev || !next) return;
+  const on = !!state.libPreviewFile && !state.libPreviewFile.isDir;
+  prev.classList.toggle('hidden', !on);
+  next.classList.toggle('hidden', !on);
+  const list = on ? previewFilesForNav() : [];
+  const i = list.findIndex(f => f.path === state.libPreviewFile.path);
+  prev.disabled = !on || i <= 0;
+  next.disabled = !on || i < 0 || i >= list.length - 1;
+  if (on) {
+    const pos = i >= 0 ? `（${i + 1} / ${list.length}）` : '';
+    prev.title = '上一个文件' + pos + '，快捷键 ←';
+    next.title = '下一个文件' + pos + '，快捷键 →';
+  }
+}
+function stepPreview(delta) {
+  if (!state.libPreviewFile) return;
+  const list = previewFilesForNav();
+  const i = list.findIndex(f => f.path === state.libPreviewFile.path);
+  if (i < 0) { toast('当前文件不在浏览列表中', true); return; }
+  const target = list[i + delta];
+  if (!target) { toast(delta > 0 ? '已经是最后一个文件' : '已经是第一个文件'); return; }
+  // 连续翻页不该把每一步都塞进「后退 / 前进」导航历史
+  const oldLock = state.navLock;
+  state.navLock = true;
+  try { gotoFile(target); }
+  finally { state.navLock = oldLock; }
+  updateNavButtons();
+}
+
 // ---------- 阅览区预览 ----------
 function clearPreview() {
   $('#preview-name').textContent = '未选择文库内容';
   $('#btn-open-external').classList.add('hidden');
   $('#btn-new-lib-inline').classList.add('hidden');
+  $('#btn-prev-file').classList.add('hidden');
+  $('#btn-next-file').classList.add('hidden');
   $('#preview-body').innerHTML = `
     <div id="preview-empty">
       <div class="empty-icon">📚</div>
@@ -536,6 +596,7 @@ function clearPreview() {
   $('#detail-body').innerHTML = '<div class="hint">未选择文件</div>';
 }
 function showPreview(e) {
+  updateFileNavButtons();
   $('#preview-name').textContent = e.name;
   const body = $('#preview-body');
   const openBtn = $('#btn-open-external');
@@ -561,8 +622,28 @@ function showPreview(e) {
     body.innerHTML = `<img class="preview-img" src="${fileUrl(e.path)}" alt="${escapeHtml(e.name)}">`;
     openBtn.classList.add('hidden');
   } else if (cat === '视频') {
-    body.innerHTML = `<video class="preview-video" src="${fileUrl(e.path)}" controls></video>`;
+    body.innerHTML = `<div class="video-stage">
+      <video class="preview-video" src="${fileUrl(e.path)}" controls playsinline></video>
+      <div class="video-tools">
+        <span>内嵌播放器（Electron / Chromium）</span>
+        <button id="pv-fs" title="全屏播放，按 ESC 退出">全屏播放</button>
+        <button id="pv-ext" title="调用系统默认播放器">系统播放器打开</button>
+      </div>
+    </div>`;
     openBtn.classList.add('hidden');
+    $('#pv-ext').onclick = () => openEntry(e);
+    $('#pv-fs').onclick = async () => {
+      const v = $('.preview-video');
+      if (!v) return;
+      try {
+        if (document.fullscreenElement) await document.exitFullscreen();
+        else if (typeof v.requestFullscreen === 'function') await v.requestFullscreen();
+        else throw new Error('当前环境不支持 Fullscreen API');
+      } catch (err) {
+        setFullscreen(true);   // 退回：把阅览区铺满应用窗口
+        toast('已切换为窗口内全屏（系统全屏不可用）：' + (err.message || ''), true);
+      }
+    };
   } else if (cat === '音频') {
     body.innerHTML = `<div style="text-align:center;width:100%">
       <div style="font-size:52px;margin-bottom:14px">🎵</div>
@@ -1127,10 +1208,37 @@ function opTagDelete(t) {
   });
 }
 
-// 操作完成后重新扫描并回到合适的视图
+// ---------- 操作完成后的刷新 / 文库改名后的历史记录重定位 ----------
+// 文库改名后，历史记录里存的还是旧绝对路径，点开就会提示"文件不存在"。
+// 把这些条目的路径前缀一并换成新文库根。
+function rebaseHistory(oldRoot, newRoot) {
+  if (!oldRoot || !newRoot) return;
+  const o = String(oldRoot).replace(/[\\/]+$/, ''), n = String(newRoot).replace(/[\\/]+$/, '');
+  const lo = o.toLowerCase();
+  let changed = false;
+  state.openHistory = state.openHistory.map(h => {
+    const p = h && h.path ? String(h.path) : '';
+    if (p.toLowerCase() === lo || p.toLowerCase().startsWith(lo + '\\') || p.toLowerCase().startsWith(lo + '/')) {
+      changed = true;
+      return Object.assign({}, h, { path: n + p.slice(o.length) });
+    }
+    return h;
+  });
+  if (changed) {
+    localStorage.setItem('fm_open_history', JSON.stringify(state.openHistory));
+    renderHistory();
+  }
+}
 async function refreshAfterOp(t, newPath) {
   if (t.kind === 'lib') {
-    if (newPath) { state.libRoot = newPath; localStorage.setItem('fm_lib_root', newPath); }
+    if (newPath) {
+      rebaseHistory(t.path, newPath);
+      // 只有当前正打开的文库被改名时才切换；否则不要莫名跳到别的文库
+      if (state.libRoot && String(state.libRoot).toLowerCase() === String(t.path).toLowerCase()) {
+        state.libRoot = newPath;
+        localStorage.setItem('fm_lib_root', newPath);
+      }
+    }
     await loadLibList();
     if (state.libRoot) await loadLibrary(true);
     state.view = 'libs';
@@ -2147,6 +2255,8 @@ function setFullscreen(on) {
   fsBtn.textContent = on ? '退出全屏' : '全屏';
 }
 fsBtn.onclick = () => setFullscreen(!previewPanel.classList.contains('fs-fullscreen'));
+$('#btn-prev-file').onclick = () => stepPreview(-1);
+$('#btn-next-file').onclick = () => stepPreview(1);
 
 // ---------- 可拖拽分隔条 ----------
 function setupSplitter(handleId, panelId, side, storageKey) {
@@ -2180,7 +2290,16 @@ setupSplitter('#split-right', '#detail-panel', '--right-w', 'fm_right_w');
 
 // ---------- 键盘 ----------
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') { hideModal(); setFullscreen(false); }
+  if (e.key === 'Escape') { hideModal(); setFullscreen(false); return; }
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  if (isComposing(e) || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+  const t = e.target;
+  // 输入区、弹窗、以及音视频控件自己要用的方向键，一律不抢
+  if (t && t.closest && t.closest('input, textarea, select, video, audio, [contenteditable="true"]')) return;
+  if (!$('#modal-mask').classList.contains('hidden')) return;
+  if (!state.libPreviewFile) return;
+  e.preventDefault();
+  stepPreview(e.key === 'ArrowLeft' ? -1 : 1);
 });
 
 // ---------- 启动 ----------
