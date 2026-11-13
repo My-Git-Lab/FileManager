@@ -1881,7 +1881,7 @@ $('#btn-add-to-group').onclick = async () => {
   const r = await window.api.libAddFiles(g.path, files);
   if (r.error) { toast(r.error, true); return; }
   if (r.failed.length) toast(`${r.failed.length} 个失败：${r.failed[0].reason}`, true);
-  else toast(`已添加 ${r.done.length} 个文件到「${g.displayName}」（${g.path}）`);
+  else toast(`已移动 ${r.done.length} 个文件到「${g.displayName}」（原位置不再保留）`);
   await loadLibrary();
   const ng = findGroup(state.libData, g.path);
   if (ng) {
@@ -1958,7 +1958,7 @@ function renderBatchForm() {
         <button id="ba-clear" type="button">清空</button>
       </div>
       <div class="ba-list">${srcHTML}</div>
-      <div class="hint">共 ${b.sources.length} 项。选择文件夹时会递归展开其中所有文件（跳过隐藏文件），平铺放入目标组；目标文库内部的文件会被跳过，避免重复复制。</div>
+      <div class="hint">共 ${b.sources.length} 项。选择文件夹时会递归展开其中所有文件（跳过隐藏文件），平铺放入目标组；目标文库内部已归档的文件会被跳过，避免打乱原有归档。<b>本操作为「移动」：添加成功后原位置不再保留</b>，源文件夹本身会保留（可能变空）。</div>
     </div>
 
     <div class="ba-sec">
@@ -1974,7 +1974,7 @@ function renderBatchForm() {
           ${b.catChoice === '__new__' ? `<input id="ba-new-cat" placeholder="输入新大类名称" value="${escapeHtml(b.newCatName)}" spellcheck="false">` : ''}
         ` : ''}
         <div class="hint">选「整个文库」或「大类」时会自动新建一个组存放本批文件；选「组」则直接加入该组。</div>
-      ` : '<div class="hint">本批文件会直接复制进所选的组（原文件保持不变）。</div>'}
+      ` : '<div class="hint">本批文件会直接移动进所选的组，成功后原位置不再保留。</div>'}
     </div>
 
     <div class="ba-sec">
@@ -2107,7 +2107,7 @@ async function submitBatch() {
   okBtn.disabled = false;
   okBtn.textContent = '开始添加';
   if (r.error) { toast(r.error, true); return true; }
-  toast(`已添加 ${r.done} 个文件${r.failed.length ? `，${r.failed.length} 个失败` : ''}${r.skipped ? `，跳过 ${r.skipped} 个` : ''}`);
+  toast(`已移动 ${r.done} 个文件（原位置不再保留）${r.failed.length ? `，${r.failed.length} 个失败` : ''}${r.skipped ? `，跳过 ${r.skipped} 个` : ''}`);
   const root = r.root, groupPath = r.groupPath;
   batchState = null;
   if (root !== state.libRoot) await selectLibrary(root);

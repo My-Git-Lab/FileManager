@@ -328,15 +328,7 @@ ipcMain.handle('fs:transfer', async (e, { mode, sources, destDir }) => {
       if (!isAllowed(src)) { results.failed.push({ src, reason: '无权访问该路径' }); continue; }
       if (isSamePath(path.dirname(src), destDir) && mode === 'move') { results.failed.push({ src, reason: '已在目标目录' }); continue; }
       if (mode === 'copy') await copyDeep(src, dest);
-      else {
-        try {
-          await fs.rename(src, dest);
-        } catch (err) {
-          // 跨磁盘/跨分区移动（Windows 上 D: <-> C: 很常见）rename 会报 EXDEV
-          if (err.code !== 'EXDEV') throw err;
-          await moveAcrossDevices(src, dest);
-        }
-      }
+      else await moveInto(src, dest);
       results.done.push(src);
     } catch (err) {
       results.failed.push({ src, reason: err.message });
@@ -351,6 +343,16 @@ async function copyDeep(src, dest) {
     for (const n of await fs.readdir(src)) await copyDeep(path.join(src, n), path.join(dest, n));
   } else {
     await fs.copyFile(src, dest);
+  }
+}
+// 把一项移动到目标路径：同盘直接 rename（快且原子），跨盘（EXDEV）退回「复制 + 校验 + 删源」。
+// 失败时源文件必须仍在原地，且不能留下半份副本。
+async function moveInto(src, dest) {
+  try {
+    await fs.rename(src, dest);
+  } catch (err) {
+    if (err.code !== 'EXDEV') throw err;
+    await moveAcrossDevices(src, dest);
   }
 }
 // 跨盘移动实际是「复制 + 删源」。复制中途失败（磁盘满、文件被占用、权限）时
@@ -368,7 +370,12 @@ async function copyStats(p) {
   return { files, dirs, bytes };
 }
 async function moveAcrossDevices(src, dest) {
-  await copyDeep(src, dest);
+  try {
+    await copyDeep(src, dest);
+  } catch (err) {
+    await fs.rm(dest, { recursive: true, force: true }).catch(() => {});
+    throw new Error('复制副本失败（' + err.message + '）；已清理副本，原文件保持不变');
+  }
   let a, b;
   try { a = await copyStats(src); b = await copyStats(dest); }
   catch (err) {
@@ -379,7 +386,12 @@ async function moveAcrossDevices(src, dest) {
     await fs.rm(dest, { recursive: true, force: true }).catch(() => {});
     throw new Error(`副本不完整（源 ${a.files} 文件 / ${a.bytes} 字节，副本 ${b.files} 文件 / ${b.bytes} 字节）；已保留原文件并清理副本`);
   }
-  await fs.rm(src, { recursive: true, force: true });
+  try {
+    await fs.rm(src, { recursive: true, force: true });
+  } catch (err) {
+    await fs.rm(dest, { recursive: true, force: true }).catch(() => {});
+    throw new Error('副本已生成但删除原文件失败（' + err.message + '）；已清理副本，原文件保持不变');
+  }
 }
 
 // ---------- IPC: 删除（移入系统回收站，不直接销毁） ----------
@@ -1117,19 +1129,25 @@ ipcMain.handle('lib:createGroup', async (e, { root, categoryName, groupName }) =
   return createGroupFolder(root, categoryName, groupName);
 });
 
-// 向组内添加文件（复制）
+// 向组内添加文件（移动：成功后原位置不再保留）
 ipcMain.handle('lib:addFiles', async (e, { groupPath, files }) => {
   if (!isAllowed(groupPath)) return { error: '无权访问该目录' };
   const results = { done: [], failed: [] };
   for (const src of files) {
-    let dest = path.join(groupPath, path.basename(src));
     try {
+      if (!isAllowed(src)) { results.failed.push({ src, reason: '无权访问该路径' }); continue; }
+      if (isSamePath(path.resolve(path.dirname(src)), path.resolve(groupPath))) {
+        results.failed.push({ src, reason: '已在目标组内' }); continue;
+      }
+      let dest = path.join(groupPath, path.basename(src));
       let i = 1;
       const ext = path.extname(src);
       while (fss.existsSync(dest)) {
         dest = path.join(groupPath, `${path.basename(src, ext)}_${i++}${ext}`);
       }
-      await copyDeep(src, dest);
+      await moveInto(src, dest);
+      // 源文件若来自某个已登记文库，把它的文件级标签一并迁到新位置
+      if (libraryRootFor(src)) await rewriteMeta(src, dest, false).catch(() => {});
       results.done.push(dest);
     } catch (err) {
       results.failed.push({ src, reason: err.message });
@@ -1393,8 +1411,15 @@ ipcMain.handle('lib:batchAdd', async (e, payload) => {
     groupPath = created.path;
   }
 
-  // 3. 复制文件：同名自动加序号；Windows 不区分大小写，重名判断也要忽略大小写
+  // 3. 移动文件：同名自动加序号；Windows 不区分大小写，重名判断也要忽略大小写
   const norm = (s) => process.platform === 'win32' ? s.toLowerCase() : s;
+  // 源文件来自已登记文库时才需要迁移元数据键；先缓存文库根，避免逐个文件重复读注册表
+  let regRoots = [];
+  try { regRoots = readRegistry().libraries.map(l => path.resolve(l.path)); } catch {}
+  const inAnyLibrary = (p) => {
+    const abs = path.resolve(p);
+    return regRoots.some(r => abs === r || abs.startsWith(r + path.sep));
+  };
   const reserved = new Set();
   try { for (const n of await fs.readdir(groupPath)) reserved.add(norm(n)); } catch {}
   const cleanTags = mergeTags([], (tags || []).map(t => String(t).trim()));
@@ -1410,7 +1435,9 @@ ipcMain.handle('lib:batchAdd', async (e, payload) => {
     while (reserved.has(norm(name))) name = `${stem}_${i++}${ext}`;
     const dest = path.join(groupPath, name);
     try {
-      await fs.copyFile(src, dest);
+      await moveInto(src, dest);
+      // 源文件若来自别的已登记文库，同步它的文件级标签，避免留下孤立键
+      if (inAnyLibrary(src)) await rewriteMeta(src, dest, false).catch(() => {});
       reserved.add(norm(name));
       done++;
     } catch (err) {
