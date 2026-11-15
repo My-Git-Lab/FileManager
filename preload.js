@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('api', {
   libRelocate: (oldPath, newPath) => ipcRenderer.invoke('lib:relocate', { oldPath, newPath }),
   libRename: (kind, target, newName) => ipcRenderer.invoke('lib:rename', { kind, target, newName }),
   libMove: (target, destDir) => ipcRenderer.invoke('lib:move', { target, destDir }),
+  libCreateCategory: (root, name) => ipcRenderer.invoke('lib:createCategory', { root, name }),
   libCreateGroup: (root, categoryName, groupName) =>
     ipcRenderer.invoke('lib:createGroup', { root, categoryName, groupName }),
   libAddFiles: (groupPath, files) => ipcRenderer.invoke('lib:addFiles', { groupPath, files }),

@@ -512,7 +512,7 @@ button { font-family: inherit; }
 #preview-name:empty { display: none; }
 #preview-actions { display: flex; gap: 6px; flex: 0 0 auto; }
 #btn-open-external, #btn-fullscreen, #btn-nav-back,
-#btn-nav-forward, #btn-new-lib-inline,
+#btn-nav-forward, #btn-new-lib-inline, #btn-new-cat-inline,
 #btn-prev-file, #btn-next-file {
   padding: 5px 12px;
   font-size: var(--fs-base);
@@ -525,7 +525,7 @@ button { font-family: inherit; }
 }
 #btn-open-external:hover, #btn-fullscreen:hover,
 #btn-nav-back:hover, #btn-nav-forward:hover,
-#btn-new-lib-inline:hover,
+#btn-new-lib-inline:hover, #btn-new-cat-inline:hover,
 #btn-prev-file:hover, #btn-next-file:hover { background: var(--hover); }
 #btn-nav-back:disabled, #btn-nav-forward:disabled,
 #btn-prev-file:disabled, #btn-next-file:disabled {

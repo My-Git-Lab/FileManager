@@ -662,7 +662,8 @@ ipcMain.handle('fs:detail', async (e, p) => {
 });
 
 // ---------- 文件文库（多文库管理：文库 → 大类 → 组 → 文件） ----------
-const DEFAULT_CATS = ['漫画', '小说'];
+// 新建文库时附带的两个默认大类。只影响「之后新建」的文库，已有文库的目录不会被改动。
+const DEFAULT_CATS = ['大类1', '大类2'];
 // 文库注册表：记录所有文库的位置（文库本体在用户指定路径，注册表在应用数据目录）
 const REGISTRY_FILE = path.join(app.getPath('userData'), 'libraries.json');
 const TAG_COLORS = ['#e74c3c', '#e67e22', '#d4a017', '#2ecc71', '#1abc9c', '#3498db', '#9b59b6', '#e91e63'];
@@ -1095,6 +1096,36 @@ ipcMain.handle('lib:migrate', async (e, { oldPath, newParent }) => {
     writeRegistry(reg);
     return { ok: true, path: target };
   } catch (err) { return { error: err.message }; }
+});
+
+// 新建大类：在文库根目录下创建一个空的大类文件夹（下次扫描即成为该文库的大类）
+// 此前大类只能由「新建组」或「批量添加」顺带创建，界面上没有独立入口。
+ipcMain.handle('lib:createCategory', async (e, { root, name }) => {
+  const safeName = String(name || '').trim();
+  const bad = nameError(safeName);
+  if (bad) return { error: bad };
+  // 扫描时以点开头的目录会被当作隐藏项跳过，建出来也看不见
+  if (safeName.startsWith('.')) return { error: '大类名称不能以点开头（会被视为隐藏项）' };
+  if (!isAllowed(root)) return { error: '无权访问该目录' };
+  const catPath = path.join(root, safeName);
+  if (!isAllowed(catPath)) return { error: '无权访问该目录' };
+  const realRoot = canonicalPath(root), realCat = canonicalPath(catPath);
+  if (!realRoot || !realCat || !withinRoot(realRoot, realCat))
+    return { error: '目标路径不在该文库内' };
+  try {
+    const st = await fs.stat(root);
+    if (!st.isDirectory()) return { error: '文库路径不是文件夹' };
+    // NTFS 不区分大小写：大小写不同也算同名，避免建出两个看起来一样的大类
+    const hit = (await fs.readdir(root)).find(n => isSamePath(n, safeName));
+    if (hit) return { error: '已存在同名大类：' + hit };
+    await fs.mkdir(catPath);   // 不用 recursive：文库根目录必须已存在
+    return { ok: true, name: safeName, path: catPath };
+  } catch (err) {
+    if (err.code === 'EPERM' || err.code === 'EBUSY' || err.code === 'EACCES')
+      return { error: '新建失败：目录正被其他程序占用，关闭后重试即可' };
+    if (err.code === 'ENOENT') return { error: '新建失败：文库目录已不存在，请刷新后重试' };
+    return { error: '新建失败：' + err.message };
+  }
 });
 
 // 新建组：命名 "YYYYMMDD_4位序号_组名"，序号按"同日"接续（换一天重新从 1 开始）

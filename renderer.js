@@ -451,7 +451,15 @@ function clearLibFilters() {
 }
 
 // 当前中间阅览区应渲染什么（由 state.view 决定）
+// 「新建大类」只在文库首页（大类网格）与大类页面（组网格）出现，其余视图隐藏
+function updateNewCatButton() {
+  const b = $('#btn-new-cat-inline');
+  if (!b) return;
+  b.classList.toggle('hidden',
+    !state.libData || !!state.libPreviewFile || (state.view !== 'lib' && state.view !== 'cat'));
+}
 function renderCurrentView() {
+  updateNewCatButton();
   switch (state.view) {
     case 'libs': showLibrariesView(); break;
     case 'lib': showLibraryHome(); break;
@@ -585,6 +593,7 @@ function clearPreview() {
   $('#preview-name').textContent = '未选择文库内容';
   $('#btn-open-external').classList.add('hidden');
   $('#btn-new-lib-inline').classList.add('hidden');
+  $('#btn-new-cat-inline').classList.add('hidden');
   $('#btn-prev-file').classList.add('hidden');
   $('#btn-next-file').classList.add('hidden');
   $('#preview-body').innerHTML = `
@@ -597,6 +606,7 @@ function clearPreview() {
 }
 function showPreview(e) {
   updateFileNavButtons();
+  $('#btn-new-cat-inline').classList.add('hidden');
   $('#preview-name').textContent = e.name;
   const body = $('#preview-body');
   const openBtn = $('#btn-open-external');
@@ -734,7 +744,7 @@ function renderBreadcrumb() {
     if (clickable) span.onclick = onclick;
     bc.appendChild(span);
   };
-  mk('全部文库', state.view !== 'libs', () => { state.view = 'libs'; renderCurrentView(); });
+  mk('全部文库', state.view !== 'libs', () => { state.libPreviewFile = null; state.view = 'libs'; renderCurrentView(); });
 
   // 「全部文库」视图或未进入文库时，只显示根级（数量由旁边的统计文字展示）
   if (state.view === 'libs' || !state.libRoot || !state.libData) return;
@@ -742,6 +752,7 @@ function renderBreadcrumb() {
   mkSep(bc);
   mk(libName, state.view !== 'lib', () => {
     state.libSel = null;
+    state.libPreviewFile = null;
     state.view = 'lib';
     renderCurrentView();
     renderLibTree();
@@ -758,6 +769,7 @@ function renderBreadcrumb() {
       mkSep(bc);
       mk(cat.name, true, () => {
         state.libSel = { type: 'category', data: cat };
+        state.libPreviewFile = null;
         state.view = 'cat';
         renderCurrentView();
         renderLibTree();
@@ -1245,6 +1257,7 @@ async function refreshAfterOp(t, newPath) {
     showLibrariesView();
     return;
   }
+  state.libPreviewFile = null;      // 列表已刷新，结束文件预览状态
   await loadLibrary(true);          // 静默重扫：state.libSel 会自动校正或被清空
   renderLibTree();
   renderBreadcrumb();
@@ -1420,6 +1433,7 @@ function bindPager(body, rerender) {
 function showLibrariesView() {
   state.view = 'libs';
   $('#btn-new-lib-inline').classList.remove('hidden');
+  updateNewCatButton();
   $('#btn-open-external').classList.add('hidden');
   $('#preview-name').textContent = `共 ${state.libLibraries.length} 个文库`;
 
@@ -1481,6 +1495,7 @@ function showLibraryHome() {
   state.view = 'lib';
   $('#btn-new-lib-inline').classList.add('hidden');
   $('#btn-open-external').classList.add('hidden');
+  updateNewCatButton();
   $('#preview-name').textContent = `${data.categories.length} 个大类 · ${data.categories.reduce((s, c) => s + c.groupCount, 0)} 组`;
 
   const cats = data.categories;
@@ -1507,7 +1522,7 @@ function showLibraryHome() {
   body.innerHTML = cats.length
     ? `<div class="grid-wrap"><div class="tile-grid cat-grid">${tiles}</div>${pagerHTML(page, pages)}</div>`
     : `<div class="preview-placeholder"><div class="big">📭</div><div>这个文库还没有大类</div>
-        <div class="empty-sub">点击左侧「新建组」时会自动创建所属大类</div></div>`;
+        <div class="empty-sub">点击上方「新建大类」创建第一个大类</div></div>`;
 
   bindPager(body, showLibraryHome);
 
@@ -1662,6 +1677,7 @@ function renderLibTree() {
 function showCategoryView(cat) {
   state.view = 'cat';
   $('#btn-new-lib-inline').classList.add('hidden');
+  updateNewCatButton();
   const groups = cat.groups.filter(matchTag);
   const pages = Math.max(1, Math.ceil(groups.length / PAGE_SIZE));
   if (state.libPageNum > pages) state.libPageNum = 1;
@@ -1746,6 +1762,7 @@ function showFilterDetails() {
 function showLibFilterView() {
   state.view = 'search';
   $('#btn-new-lib-inline').classList.add('hidden');
+  updateNewCatButton();
   const kw = state.libSearch.toLowerCase();
   const tag = state.libTagFilter;
   let list, mode, levels;
@@ -1809,6 +1826,7 @@ function showLibFilterView() {
 function showGroupPreview(g, cat) {
   state.view = 'group';
   $('#btn-new-lib-inline').classList.add('hidden');
+  updateNewCatButton();
   $('#preview-name').textContent = `${g.displayName}${g.seq != null ? '（#' + String(g.seq).padStart(4, '0') + '）' : ''} · ${g.fileCount} 个文件`;
   const body = $('#preview-body');
   if (!g.files.length) {
@@ -1881,6 +1899,35 @@ $('#btn-rescan').onclick = () => loadLibrary(false);
 
 $('#btn-lib-switch').onclick = () => openLibSwitchModal();
 $('#btn-new-lib-inline').onclick = () => openLibCreateModal();
+
+// 新建大类：文库首页（大类网格）与大类页面（组网格）的阅览区上方都可进入
+$('#btn-new-cat-inline').onclick = () => openCatCreateModal();
+function openCatCreateModal() {
+  if (!state.libRoot || !state.libData) { toast('请先创建或选择一个文库', true); return; }
+  showModal('新建大类', `
+    <label class="field-label">所属文库</label>
+    <div class="hint" style="margin:0 0 8px">${escapeHtml(state.libData.name || state.libRoot)}</div>
+    <label class="field-label">大类名称</label>
+    <input id="m-cat-name" placeholder="例如：画集" spellcheck="false">
+    <div class="hint">将在文库目录下新建一个同名文件夹。名称不能与现有大类重复（Windows 下不区分大小写），也不能包含 \\ / : * ? " < > | 等字符。建好后可用左侧「新建组」或「批量添加」往里放文件</div>`, async () => {
+    const name = $('#m-cat-name').value.trim();
+    if (!name) { toast('请输入大类名称', true); return true; }
+    const r = await window.api.libCreateCategory(state.libRoot, name);
+    if (r.error) { toast(r.error, true); return true; }
+    toast(`已创建大类：${r.name}`);
+    state.libSel = null;
+    state.libPreviewFile = null;
+    state.libExpanded.add(r.name);
+    clearLibFilters();
+    state.view = 'lib';
+    await loadLibrary(true);
+    const idx = (state.libData?.categories || []).findIndex(c => c.path === r.path);
+    state.libPageNum = idx >= 0 ? Math.floor(idx / PAGE_SIZE) + 1 : 1;
+    renderCurrentView();
+    renderLibTree();
+    renderBreadcrumb();
+  }, '创建');
+}
 $('#btn-open-lib-root').onclick = () => {
   if (!state.libRoot) { toast('请先创建或选择一个文库', true); return; }
   window.api.showInFolder(state.libRoot);
@@ -1891,8 +1938,8 @@ function openLibCreateModal(prev = {}) {
     <label class="field-label">位置</label>
     <div class="search-row"><input id="m-lib-path" placeholder="点击右侧「选择…」指定创建位置" readonly value="${escapeHtml(prev.path || '')}"><button id="m-lib-pick" type="button">选择…</button></div>
     <label class="field-label">文库名称</label>
-    <input id="m-lib-name" placeholder="例如：我的漫画库" spellcheck="false" value="${escapeHtml(prev.name || '')}">
-    <div class="hint">将在所选位置创建以名称命名的文件夹，内含默认大类（漫画/小说）与独立账本</div>`, async () => {
+    <input id="m-lib-name" placeholder="例如：我的资料库" spellcheck="false" value="${escapeHtml(prev.name || '')}">
+    <div class="hint">将在所选位置创建以名称命名的文件夹，内含默认大类（大类1/大类2）与独立账本</div>`, async () => {
     const parentPath = $('#m-lib-path').value.trim();
     const name = $('#m-lib-name').value.trim();
     if (!parentPath) { toast('请先选择创建位置', true); return true; }
@@ -1953,6 +2000,10 @@ $('#btn-lib-migrate').onclick = () => {
 
 $('#btn-new-group').onclick = () => {
   if (!state.libData) { toast('请先创建或选择文库', true); return; }
+  if (!state.libData.categories.length) {
+    toast('当前文库还没有大类，请先点击阅览区上方「新建大类」', true);
+    return;
+  }
   const opts = state.libData.categories.map(c =>
     `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}（${c.groupCount} 组）</option>`).join('');
   showModal('新建文件组', `
