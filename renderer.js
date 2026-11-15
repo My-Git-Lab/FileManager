@@ -112,7 +112,7 @@ function effectiveMeta(rel) {
       if (name && !tags.has(name)) tags.set(name, { name, color, from });
     }
   });
-  return { authors, sources, tags: [...tags.values()] };
+  return { authors, sources, tags: [...tags.values()].sort((a, b) => tagCompare(a.name, b.name)) };
 }
 function tagHit(rel, name) {
   return !!name && effectiveMeta(rel).tags.some(x => x.name === name);
@@ -157,21 +157,108 @@ function ownMetaBlockHTML(own, level) {
   const tags = (own.tags || []).map(x => {
     const n = typeof x === 'string' ? x : x.name;
     return { name: n, color: safeTagColor(typeof x === 'string' ? '' : x.color, n), from: level };
-  });
+  }).sort((a, b) => tagCompare(a.name, b.name));
   return `<div class="box-title" style="padding:10px 0 4px">维护信息</div>
     ${metaRowsHTML(mk(own.author), tags, mk(own.source), level)}`;
 }
-function splitMetaList(v) {
-  return [...new Set(String(v || '').split(/[、,，;；\n]+/).map(x => x.trim()).filter(Boolean))];
+// 标签统一按名称排序（中文拼音 + 数字按数值），与添加标签的先后顺序无关。
+// 与主进程同名规则保持一致；末尾码点比较兜底，保证顺序确定。
+function tagCompare(a, b) {
+  const x = String(a == null ? '' : a), y = String(b == null ? '' : b);
+  return x.localeCompare(y, 'zh', { numeric: true }) || (x < y ? -1 : x > y ? 1 : 0);
 }
+function sortTagNames(list) {
+  return [...new Set((list || [])
+    .map(x => typeof x === 'string' ? x : ((x && x.name) || ''))
+    .map(x => String(x).trim()).filter(Boolean))].sort(tagCompare);
+}
+function splitMetaList(v) {
+  return sortTagNames(String(v || '').split(/[、,，;；\n]+/));
+}
+// ---------- 跨文库标签库：「添加已有标签」多选 ----------
+// 标签库存放在各个文库目录里，主进程按「当前仍在使用的标签」汇总并集后经 libTagBanks 返回。
+// 每个编辑弹窗打开时重新拉一次，保证刚在别的文库加过的标签立刻可见、删掉的标签立刻消失。
+let tagBankData = [];
+async function refreshTagBanks() {
+  const r = await window.api.libTagBanks();
+  tagBankData = (r && Array.isArray(r.tags))
+    ? [...r.tags].sort((a, b) => tagCompare(a.name, b.name)) : [];
+  return tagBankData;
+}
+function tagBankChipHTML(t, selected) {
+  const libs = (t.libs || []).join('、');
+  return `<span class="tag-chip tb-chip${selected ? ' active' : ''}" data-tb="${escapeHtml(t.name)}" `
+    + `style="--tag-c:${metaTagColor(t.name)}" title="${escapeHtml(libs ? '来自：' + libs : '已有标签')}">`
+    + `${escapeHtml(t.name)}</span>`;
+}
+function tagBankSectionHTML(query, hint) {
+  return `<div class="tb-box">
+    <div class="tb-head"><span class="tb-title">添加已有标签（可多选）</span><span class="tb-count" id="tb-count"></span></div>
+    <div class="tb-row">
+      <input id="tb-search" placeholder="按关键字筛选标签" value="${escapeHtml(query || '')}" spellcheck="false">
+      <button id="tb-refresh" type="button">刷新</button>
+    </div>
+    <div class="tb-list" id="tb-list"></div>
+    <div class="hint">${hint || '候选是各文库当前仍在使用的标签（按名称排序）；点一下加入，再点一下移除。'}</div>
+  </div>`;
+}
+// 通用绑定：不同弹窗靠 getNames / setNames 适配，真源始终是各自的标签集合。
+//   · 普通编辑框：真源是「、」分隔的文本框
+//   · 批量添加：真源是 batchState.tags（setNames 里整表重绘）
+//   · single：改名弹窗，点一个标签就把输入框换成这个名字
+function bindTagBankSection(opts) {
+  const { getNames, setNames, single, scope, onAfter, onQuery } = opts;
+  const rootEl = scope || document;
+  const search = rootEl.querySelector('#tb-search');
+  const list = rootEl.querySelector('#tb-list');
+  const count = rootEl.querySelector('#tb-count');
+  if (!list) return () => {};
+  const paint = () => {
+    const q = (search ? search.value : '').trim().toLowerCase();
+    const cur = getNames();
+    const shown = tagBankData.filter(t => !q || t.name.toLowerCase().includes(q));
+    list.innerHTML = shown.length
+      ? shown.map(t => tagBankChipHTML(t, cur.includes(t.name))).join('')
+      : `<span class="hint">${tagBankData.length ? '没有匹配这个关键字的标签' : '还没有任何文库记录过标签，先在上方手动输入几个吧'}</span>`;
+    if (count) count.textContent = tagBankData.length
+      ? `共 ${tagBankData.length} 个 · 已选 ${cur.length} 个` : '';
+    list.querySelectorAll('.tb-chip').forEach(chip => {
+      chip.onclick = () => {
+        const name = chip.dataset.tb;
+        const names = getNames();
+        const hit = names.includes(name);
+        const next = single ? [name]
+          : sortTagNames(hit ? names.filter(n => n !== name) : [...names, name]);
+        setNames(next);
+        if (onAfter) onAfter(); else paint();
+      };
+    });
+  };
+  if (search) {
+    search.addEventListener('input', () => { if (onQuery) onQuery(search.value); paint(); });
+    // 搜索框里的回车只用于筛选，不要连带触发弹窗的「确定」
+    search.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !isComposing(e)) e.preventDefault(); });
+  }
+  const btn = rootEl.querySelector('#tb-refresh');
+  if (btn) btn.onclick = async () => {
+    btn.disabled = true;
+    try { await refreshTagBanks(); paint(); }
+    catch (err) { toast('读取标签库失败：' + (err && err.message ? err.message : err), true); }
+    finally { btn.disabled = false; }
+  };
+  paint();
+  return paint;
+}
+
 // 统一的编辑入口：只改本级自己填的值，上级信息自动继承，不在本级重复存储
 function bindMetaEdit(rel, level, name, root, ownOverride) {
   const btn = $('#btn-edit-meta');
   if (!btn || rel == null) return;
-  btn.onclick = () => {
+  btn.onclick = async () => {
+    try { await refreshTagBanks(); } catch { tagBankData = []; }
     const own = ownOverride || ownMeta(rel);
     const isFile = level === 'file';
-    const tagVal = (own.tags || []).map(x => typeof x === 'string' ? x : x.name).join('、');
+    const tagVal = sortTagNames(own.tags || []).join('、');
     const body = `${isFile ? '' : `
       <label class="field-label">作者（多个用「、」分隔，留空表示不填写）</label>
       <input id="m-author" value="${escapeHtml((own.author || []).join('、'))}" spellcheck="false">
@@ -179,6 +266,7 @@ function bindMetaEdit(rel, level, name, root, ownOverride) {
       <input id="m-source" value="${escapeHtml((own.source || []).join('、'))}" spellcheck="false">`}
       <label class="field-label">标签（多个用「、」分隔）</label>
       <input id="m-tags" value="${escapeHtml(tagVal)}" spellcheck="false">
+      ${tagBankSectionHTML('', '候选是各文库当前仍在使用的标签；点一下加入、再点一下移除，也可以直接在上方输入新标签。')}
       <div class="hint">这里只修改「${escapeHtml(name || '')}」自己的信息。上级的非空信息会自动继承下来，不需要重复填写。${isFile ? '文件不记录作者与来源。' : ''}</div>`;
     showModal(`编辑信息 · ${name || ''}`, body, async () => {
       const patch = { tags: splitMetaList($('#m-tags') ? $('#m-tags').value : '') };
@@ -195,6 +283,13 @@ function bindMetaEdit(rel, level, name, root, ownOverride) {
       refreshDetails();
       return;
     }, '保存');
+    // 选取候选等价于往标签文本框里增删一项，保存逻辑完全不变
+    const repaint = bindTagBankSection({
+      getNames: () => splitMetaList($('#m-tags') ? $('#m-tags').value : ''),
+      setNames: (ns) => { const el = $('#m-tags'); if (el) el.value = sortTagNames(ns).join('、'); }
+    });
+    const tagInput = $('#m-tags');
+    if (tagInput) tagInput.addEventListener('input', repaint);
   };
 }
 
@@ -255,7 +350,8 @@ function showModal(title, bodyHTML, onOK, okText = '确定', onCancel = null, op
   // 输入框内按 Enter 直接触发确定（输入法选字过程中不触发，避免把候选词选择当成确定）。
   // 多项表单通过 opts.enterOK=false 关掉这个行为，由表单自己处理回车。
   if (opts.enterOK !== false) {
-    $('#modal-body').querySelectorAll('input').forEach(inp => {
+    // 标签库搜索框只做筛选，回车不该连带触发弹窗的「确定」
+    $('#modal-body').querySelectorAll('input:not(#tb-search)').forEach(inp => {
       bindEnter(inp, () => $('#modal-ok').click());
     });
   }
@@ -1158,14 +1254,14 @@ async function opDelete(t) {
 // ---------- 组标签操作：添加 / 修改 / 删除 ----------
 // 统一写回标签（一处实现，右键菜单与右侧详情共用）
 async function setGroupTags(g, names) {
-  const r = await window.api.libSetMeta(state.libRoot, g.rel, 'group', { tags: names });
+  const r = await window.api.libSetMeta(state.libRoot, g.rel, 'group', { tags: sortTagNames(names) });
   if (r && r.error) { toast(r.error, true); return false; }
   await loadLibrary(true);
   renderTagChips();
   refreshDetails();
   return true;
 }
-function groupTagNames(g) { return (g.tags || []).map(t => t.name); }
+function groupTagNames(g) { return sortTagNames((g.tags || []).map(t => t.name)); }
 
 // 弹出标签列表供选择（该组暂无标签时给出提示）
 function pickTag(g, title, emptyHint, onPick) {
@@ -1179,34 +1275,52 @@ function pickTag(g, title, emptyHint, onPick) {
   });
 }
 
-function opTagAdd(t) {
+// 组右键「添加标签」：改成与「编辑信息」一致的标签集合编辑，
+// 既能一次选多个已有标签，也能手动输入、顺手删掉不需要的。
+async function opTagAdd(t) {
   const g = findGroupByPath(t.path);
   if (!g) return;
+  try { await refreshTagBanks(); } catch { tagBankData = []; }
+  const cur = groupTagNames(g);
   showModal('添加标签', `
-    <label class="field-label">标签名称</label>
-    <input id="m-input" spellcheck="false">
-    <div class="hint">支持中文；回车或点「保存」即可，可反复添加多个标签</div>`, async () => {
-    const v = $('#m-input').value.trim();
-    if (!v) return true;
-    const names = groupTagNames(g);
-    if (names.includes(v)) { toast('这个组已经有同名标签了', true); return true; }
-    if (await setGroupTags(g, [...names, v])) toast(`已添加标签「${v}」`);
+    <label class="field-label">标签（多个用「、」分隔）</label>
+    <input id="m-tags" value="${escapeHtml(cur.join('、'))}" spellcheck="false">
+    ${tagBankSectionHTML('', '候选是各文库当前仍在使用的标签；点一下加入、再点一下移除。')}
+    <div class="hint">保存后整体替换「${escapeHtml(g.displayName)}」的标签，组内文件自动继承；也可以直接在上方手动输入新标签。</div>`, async () => {
+    const names = splitMetaList($('#m-tags') ? $('#m-tags').value : '');
+    if (await setGroupTags(g, names)) toast('标签已保存');
   }, '保存');
+  const repaint = bindTagBankSection({
+    getNames: () => splitMetaList($('#m-tags') ? $('#m-tags').value : ''),
+    setNames: (ns) => { const el = $('#m-tags'); if (el) el.value = sortTagNames(ns).join('、'); }
+  });
+  const tagInput = $('#m-tags');
+  if (tagInput) tagInput.addEventListener('input', repaint);
 }
 
-function opTagRename(t) {
+async function opTagRename(t) {
   const g = findGroupByPath(t.path);
   if (!g) return;
-  pickTag(g, '修改标签', '这个组还没有标签，先添加吧', (old) => {
+  pickTag(g, '修改标签', '这个组还没有标签，先添加吧', async (old) => {
+    try { await refreshTagBanks(); } catch { tagBankData = []; }
     showModal('修改标签', `
       <label class="field-label">新的标签名称</label>
       <input id="m-input" value="${escapeHtml(old)}" spellcheck="false">
+      ${tagBankSectionHTML('', '也可以直接点一个已有标签，把它作为新名称。')}
       <div class="hint">只改这个组上的这个标签，其他组不受影响</div>`, async () => {
       const v = $('#m-input').value.trim();
       if (!v || v === old) return;
-      const names = groupTagNames(g).map(n => (n === old ? v : n));
+      const names = sortTagNames(groupTagNames(g).map(n => (n === old ? v : n)));
       if (await setGroupTags(g, names)) toast(`标签已改为「${v}」`);
     }, '保存');
+    // 改名是单选：点候选标签就替换输入框里的名字
+    const repaint = bindTagBankSection({
+      single: true,
+      getNames: () => { const v = $('#m-input') ? $('#m-input').value.trim() : ''; return v ? [v] : []; },
+      setNames: (ns) => { const el = $('#m-input'); if (el) el.value = ns[0] || ''; }
+    });
+    const inp = $('#m-input');
+    if (inp) inp.addEventListener('input', repaint);
   });
 }
 
@@ -1563,7 +1677,7 @@ function allTags() {
   for (const m of Object.values(mm))
     for (const x of (m.tags || []))
       if (x && x.name && !map.has(x.name)) map.set(x.name, safeTagColor(x.color, x.name));
-  return map;
+  return new Map([...map].sort((a, b) => tagCompare(a[0], b[0])));
 }
 function renderTagLevels() {
   const box = $('#tag-levels');
@@ -1660,7 +1774,7 @@ function renderLibTree() {
       for (const g of shown) {
         const row = document.createElement('div');
         row.className = 'group-row' + (state.libSel?.type === 'group' && state.libSel.data.path === g.path ? ' selected' : '');
-        const dots = (g.tags || []).map(t => `<i class="tag-dot" style="background:${safeTagColor(t.color, t.name)}" title="${escapeHtml(t.name)}"></i>`).join('');
+        const dots = [...(g.tags || [])].sort((a, b) => tagCompare(a.name, b.name)).map(t => `<i class="tag-dot" style="background:${safeTagColor(t.color, t.name)}" title="${escapeHtml(t.name)}"></i>`).join('');
         row.innerHTML = `<span class="g-seq">${g.seq != null ? String(g.seq).padStart(4, '0') : '—'}</span>
           <span class="g-name" title="${escapeHtml(g.path)}">${escapeHtml(g.displayName)}</span>
           <span class="g-dotwrap">${dots}</span>
@@ -1689,7 +1803,7 @@ function showCategoryView(cat) {
     <div class="tile g-tile${selClass(g.path)}" data-i="${i}"${cardDataAttr('group', g.path, g.displayName)}>
       <div class="t-slot">
         ${g.cover ? `<img src="${escapeHtml(fileUrl(g.cover))}" alt="">` : '<span class="cover-fallback">📚</span>'}
-        ${(g.tags && g.tags.length) ? `<div class="t-tags">${g.tags.map(t => `<i style="background:${safeTagColor(t.color, t.name)}" title="${escapeHtml(t.name)}"></i>`).join('')}</div>` : ''}
+        ${(g.tags && g.tags.length) ? `<div class="t-tags">${[...g.tags].sort((a, b) => tagCompare(a.name, b.name)).map(t => `<i style="background:${safeTagColor(t.color, t.name)}" title="${escapeHtml(t.name)}"></i>`).join('')}</div>` : ''}
       </div>
       <div class="t-foot">
         <div class="t-name" title="${escapeHtml(g.displayName)}">${escapeHtml(g.displayName)}</div>
@@ -2058,7 +2172,7 @@ $('#btn-add-to-group').onclick = async () => {
 const BA_TAG_COLORS = META_TAG_COLORS;
 function batchTagColor(name) { return metaTagColor(name); }
 function batchTagChipsHtml(tags) {
-  return tags.map(t => `<span class="tag-chip mini" style="--tag-c:${batchTagColor(t)}">${escapeHtml(t)}<i class="tag-x" data-ba-x="${escapeHtml(t)}" title="移除">✕</i></span>`).join('');
+  return sortTagNames(tags).map(t => `<span class="tag-chip mini" style="--tag-c:${batchTagColor(t)}">${escapeHtml(t)}<i class="tag-x" data-ba-x="${escapeHtml(t)}" title="移除">✕</i></span>`).join('');
 }
 
 function batchLocRow(b, loc, text, kindText, cls) {
@@ -2149,6 +2263,7 @@ function renderBatchForm() {
         <button id="ba-tag-add" type="button">添加</button>
       </div>
       <div class="ba-chips">${b.tags.length ? batchTagChipsHtml(b.tags) : '<span class="hint">尚未添加标签</span>'}</div>
+      ${tagBankSectionHTML(b.tbQuery || '', '候选是各文库当前仍在使用的标签；点一下加入、再点一下移除，选中的会进入上方标签列表。')}
       <div class="hint">作为本批所属「组」的标签保存，组内文件自动继承；左侧「按标签」检索可指定搜索层级。</div>
     </div>
 
@@ -2207,7 +2322,7 @@ function bindBatchEvents() {
     if (!inp) return;
     const v = inp.value.trim();
     if (!v) return;
-    if (!b.tags.includes(v)) b.tags.push(v);
+    if (!b.tags.includes(v)) { b.tags.push(v); b.tags = sortTagNames(b.tags); }
     b.focusTag = true;
     renderBatchForm();
   };
@@ -2217,6 +2332,13 @@ function bindBatchEvents() {
   body.querySelectorAll('[data-ba-x]').forEach(el => el.onclick = () => {
     b.tags = b.tags.filter(t => t !== el.dataset.baX);
     renderBatchForm();
+  });
+  bindTagBankSection({
+    scope: body,
+    getNames: () => b.tags,
+    setNames: (ns) => { b.tags = sortTagNames(ns); renderBatchForm(); },
+    onQuery: (q) => { b.tbQuery = q; },
+    onAfter: () => {}          // setNames 已整表重绘，无需再画旧节点
   });
   if (b.focusTag) {
     b.focusTag = false;
@@ -2286,13 +2408,14 @@ async function openBatchAdd() {
   const fresh = {
     sources: [], locations: [], loc: null,
     groupName: '', catChoice: '', newCatName: '',
-    author: '', tags: [], source: '', busy: false, focusTag: false
+    author: '', tags: [], source: '', busy: false, focusTag: false, tbQuery: ''
   };
   try { fresh.locations = await window.api.libLocations(); } catch { fresh.locations = []; }
   if (!fresh.locations.length) { toast('请先创建或选择一个可用的文库', true); return; }
   const cur = fresh.locations.find(l => l.path === state.libRoot) || fresh.locations[0];
   fresh.loc = { level: 'lib', path: cur.path, libPath: cur.path, catName: '', label: cur.name };
   fresh.catChoice = cur.categories.length ? cur.categories[0].name : '__new__';
+  try { await refreshTagBanks(); } catch { tagBankData = []; }
   batchState = fresh;
   renderBatchForm();
 }

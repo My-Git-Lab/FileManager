@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld('api', {
   libAddFiles: (groupPath, files) => ipcRenderer.invoke('lib:addFiles', { groupPath, files }),
   libSetMeta: (root, rel, level, patch) =>
     ipcRenderer.invoke('lib:setMeta', { root, rel, level, patch }),
+  libTagBanks: () => ipcRenderer.invoke('lib:tagBanks'),
   libSetCover: (root, groupPath, cover) =>
     ipcRenderer.invoke('lib:setCover', { root, groupPath, cover }),
   libLocations: () => ipcRenderer.invoke('lib:locations'),

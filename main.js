@@ -674,6 +674,13 @@ function tagColor(name) {
   return TAG_COLORS[h % TAG_COLORS.length];
 }
 
+// 标签统一按名称排序（中文拼音 + 数字按数值），与添加标签的先后顺序无关。
+// 末尾用码点比较兜底，保证只差大小写 / 全半角的标签也有确定的顺序。
+function tagCompare(a, b) {
+  const x = String(a == null ? '' : a), y = String(b == null ? '' : b);
+  return x.localeCompare(y, 'zh', { numeric: true }) || (x < y ? -1 : x > y ? 1 : 0);
+}
+
 // ---------- 层级元数据：文库 / 大类 / 组 / 文件共用的「作者 / 标签 / 来源」 ----------
 // 键是相对文库根目录的路径：''=文库本身，'大类'=大类，'大类/组'=组，'大类/组/文件'=文件。
 // 作者与来源用字符串数组（可多值），标签用 {name,color} 数组；文件层级只保留标签。
@@ -695,7 +702,7 @@ function mergeTags(a, b) {
     seen.add(name);
     out.push({ name, color: safeTagColor(t && t.color, name) });
   }
-  return out;
+  return out.sort((a, b) => tagCompare(a.name, b.name));
 }
 // 颜色会被渲染层插进 HTML 的 style 属性，而账本可能来自「别人给你的文库文件夹」。
 // 只接受合法的 #RGB / #RGBA / #RRGGBB / #RRGGBBAA，其它一律按标签名重新分配，
@@ -832,6 +839,68 @@ async function writeLedger(lp, led, root) {
   await fs.writeFile(lp, JSON.stringify(dehydrateLedger(led, root), null, 2));
 }
 
+// ---------- 文库标签库：每个文库一份，随文库文件夹一起存放 ----------
+// .library-tags.json 与 .library-index.json 同级，记录该文库里四个层级「当前仍在使用」的
+// 标签并集（不是历史累计）。它不在程序本体、也不在应用数据目录：文库被整体搬走 / 复制到
+// 别的机器 / 删除时，标签库跟着一起走，不会凭空留下或丢失。
+// 真源是账本里的标签；这里只是随文库存放的副本，统一按名称排序，不含绝对路径等隐私信息。
+const TAG_BANK_FILE = '.library-tags.json';
+function tagBankPath(root) { return path.join(root, TAG_BANK_FILE); }
+function cleanTagNames(list) {
+  const out = [], seen = new Set();
+  for (const t of (list || [])) {
+    const name = String(typeof t === 'string' ? t : ((t && t.name) || '')).trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out.sort(tagCompare);
+}
+function readTagBank(root) {
+  try {
+    const raw = JSON.parse(fss.readFileSync(tagBankPath(root), 'utf8'));
+    const arr = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.tags) ? raw.tags : []);
+    return cleanTagNames(arr);
+  } catch { return []; }            // 不存在 / 损坏 / 旧格式：一律按空库处理
+}
+// 先写临时文件再改名，避免程序被强关时留下半个 JSON；个别环境不允许覆盖时退回直接写。
+async function writeTagBank(root, names) {
+  const clean = cleanTagNames(names);       // 统一按名称排序，与添加顺序无关
+  const dest = tagBankPath(root), tmp = dest + '.tmp';
+  const payload = JSON.stringify({ version: 1, tags: clean }, null, 2);
+  // 内容没变就不写：刷新标签库时避免无谓的磁盘写入
+  try { if (fss.readFileSync(dest, 'utf8') === payload) return clean; } catch {}
+  await fs.writeFile(tmp, payload);
+  try {
+    try { await fs.rename(tmp, dest); }
+    catch (err) { await fs.writeFile(dest, payload); }   // 个别环境不允许覆盖
+  } finally {
+    await fs.unlink(tmp).catch(() => {});                // 无论成败都不留 .tmp
+  }
+  return clean;
+}
+// 从账本收集四个层级（文库 / 大类 / 组 / 文件）自己填过的所有标签
+async function ledgerTagNames(root, strict) {
+  let led;
+  try { led = await readLedger(path.join(root, '.library-index.json'), root); }
+  catch { return strict ? null : []; }    // 账本不可读：严格模式交给调用方回退到标签库
+  const names = [];
+  for (const m of Object.values(metaFromLedger(led, root)))
+    for (const t of (m.tags || [])) names.push(typeof t === 'string' ? t : t.name);
+  return cleanTagNames(names);
+}
+// 标签库 = 账本里「当前仍然存在」的标签快照：从某一层级删掉标签后，
+// 只要全库再没有别的层级用它，这个词就会从标签库消失，不再留作历史候选。
+async function syncTagBank(root) {
+  const names = await ledgerTagNames(root);
+  return writeTagBank(root, names);
+}
+// 标签库只是辅助功能：写失败只记日志，绝不影响标签本身已经保存成功的主流程。
+async function bestEffortSyncTagBank(root) {
+  try { await syncTagBank(root); }
+  catch (err) { console.log('[标签库] 同步失败（不影响标签保存）：' + err.message); }
+}
+
 // 递归收集目录内所有文件
 async function collectFiles(dir, depth = 0) {
   let fileCount = 0, totalSize = 0;
@@ -953,6 +1022,8 @@ async function scanLibrary(root) {
     try {
       await writeLedger(ledgerPath, indexData, root);
     } catch {}
+    // 按账本重建本文库标签库：老文库升级、账本被外部改动、已删除的标签都在这里同步
+    await bestEffortSyncTagBank(root);
     return indexData;
   } catch (err) { return { error: err.message }; }
 }
@@ -990,6 +1061,38 @@ ipcMain.handle('lib:relocate', async (e, { oldPath, newPath }) => {
     writeRegistry(reg);
     return { ok: true, name: entry.name, path: target };
   } catch (err) { return { error: err.message }; }
+});
+
+// 所有文库「当前仍在使用」的标签并集：供「添加已有标签」跨文库选取。
+// 真源是各文库账本里四个层级现存的标签；标签库文件只是随文库存放的副本，
+// 每次读取时顺手刷新成当前值（早期累计词库里的历史词会自动清掉）。
+// 账本不可读时才回退到标签库快照，避免账本损坏时把候选标签误清空。
+ipcMain.handle('lib:tagBanks', async () => {
+  const map = new Map();                    // 标签名 -> 来源文库名集合
+  let libs = [];
+  try { libs = readRegistry().libraries || []; } catch {}
+  for (const lib of libs) {
+    const root = lib.path;
+    if (!root || !fss.existsSync(root) || !isAllowed(root)) continue;
+    let names;
+    try {
+      const current = await ledgerTagNames(root, true);
+      if (current === null) names = readTagBank(root);
+      else {
+        names = current;
+        await bestEffortSyncTagBank(root);  // 让标签库文件与账本保持一致
+      }
+    } catch { continue; }
+    const label = lib.name || path.basename(root);
+    for (const n of cleanTagNames(names)) {
+      if (!map.has(n)) map.set(n, new Set());
+      map.get(n).add(label);
+    }
+  }
+  const tags = [...map.entries()]
+    .sort((a, b) => tagCompare(a[0], b[0]))
+    .map(([name, ls]) => ({ name, libs: [...ls].sort(tagCompare) }));
+  return { tags };
 });
 
 // 文库列表（注册表内容 + 是否仍存在于磁盘）
@@ -1061,6 +1164,7 @@ ipcMain.handle('lib:create', async (e, { parentPath, name }) => {
     if (fss.existsSync(libPath)) return { error: '目标文件夹已存在：' + libPath };
     await fs.mkdir(libPath, { recursive: true });
     for (const c of DEFAULT_CATS) await fs.mkdir(path.join(libPath, c), { recursive: true });
+    await bestEffortSyncTagBank(libPath);   // 新建文库即带一份空标签库（与文库一起存在）
     const reg = readRegistry();
     if (reg.libraries.some(l => l.path === libPath)) return { error: '该文库已在列表中' };
     reg.libraries.push({ name: safeName, path: libPath, createdAt: Date.now() });
@@ -1220,6 +1324,7 @@ async function writeMeta(root, rel, patch, level) {
   if (next.author.length || next.source.length || next.tags.length) mm[rel] = next;
   else delete mm[rel];
   await writeLedger(lp, persistMeta(led, mm), root);
+  await bestEffortSyncTagBank(root);
   return { ok: true, meta: next };
 }
 // 批量添加用：保留该组已有的作者 / 来源 / 标签，把新一批的值合并进去（去重）
@@ -1238,6 +1343,7 @@ async function mergeMeta(root, rel, patch, level) {
   if (next.author.length || next.source.length || next.tags.length) mm[rel] = next;
   else delete mm[rel];
   await writeLedger(lp, persistMeta(led, mm), root);
+  await bestEffortSyncTagBank(root);
   return next;
 }
 ipcMain.handle('lib:setMeta', async (e, { root, rel, level, patch }) => {
