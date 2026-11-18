@@ -962,7 +962,8 @@ async function scanLibrary(root) {
       try { if ((await fs.stat(path.join(root, n))).isDirectory()) catNames.push(n); } catch {}
     }
     const categories = [];
-    for (const cn of catNames) {
+    // 大类按名称排序（中文拼音 + 数字按数值），与文件夹创建顺序无关
+    for (const cn of catNames.sort(tagCompare)) {
       const catPath = path.join(root, cn);
       const catRel = relKey(root, catPath);
       const catOwn = metaMap[catRel] || emptyMeta();
@@ -1003,7 +1004,8 @@ async function scanLibrary(root) {
           cover
         });
       }
-      groups.sort((a, b) => ((a.seq ?? 1e9) - (b.seq ?? 1e9)) || a.name.localeCompare(b.name, 'zh'));
+      // 组按显示名排序，原名兜底；不再按日期/序号排
+      groups.sort((a, b) => tagCompare(a.displayName, b.displayName) || tagCompare(a.name, b.name));
       categories.push({
         name: cn, path: catPath, rel: catRel,
         groupCount: groups.length,
@@ -1138,6 +1140,8 @@ ipcMain.handle('lib:list', async () => {
     libs.push({ name: lib.name, path: lib.path, exists, mtime,
       catCount, groupCount, fileCount, totalSize, updatedAt, cover, meta: libMeta });
   }
+  // 文库按名称排序，与注册表登记顺序无关
+  libs.sort((a, b) => tagCompare(a.name, b.name));
   return libs;
 });
 

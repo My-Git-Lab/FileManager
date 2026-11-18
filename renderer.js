@@ -1618,8 +1618,9 @@ function showLibraryHome() {
   const page = state.libPageNum;
   const slice = cats.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
   const tiles = slice.map((c, i) => {
-    const covers = c.groups.map(g => g.cover).filter(Boolean).slice(0, 4);
-    const cells = [0, 1, 2, 3].map(k => covers[k]
+    // 大类卡片展示前 9 个组（3×3），没有封面的位置显示占位块
+    const covers = c.groups.slice(0, 9).map(g => g.cover);
+    const cells = Array.from({ length: 9 }, (_, k) => covers[k]
       ? `<img src="${escapeHtml(fileUrl(covers[k]))}" alt="">`
       : `<div class="m-cell">${k === 0 ? '📚' : ''}</div>`).join('');
     return `
@@ -1739,7 +1740,9 @@ function collectTagResults(tag) {
             sub: `${g.displayName} · ${fmtSize(f.size)}` });
     }
   }
-  return out;
+  // 层级间按 文库 → 大类 → 组 → 文件，同一层级内按名称排序
+  const levelOrder = { lib: 0, cat: 1, group: 2, file: 3 };
+  return out.sort((a, b) => (levelOrder[a.kind] - levelOrder[b.kind]) || tagCompare(a.name, b.name));
 }
 
 // ---------- 文库树（左） ----------
@@ -1892,6 +1895,7 @@ function showLibFilterView() {
     list = getLibFiles();
     if (state.libCatFilter !== '全部') list = list.filter(x => x.file.category === state.libCatFilter);
     if (kw) list = list.filter(x => x.file.name.toLowerCase().includes(kw));
+    list.sort((a, b) => tagCompare(a.file.name, b.file.name));
   }
   filterInfo = { list, kw, cat: state.libCatFilter, tag, levels, mode };
 
