@@ -10,12 +10,21 @@
   <!-- 页面不再有顶部工具栏：仅保留左（工作区）/ 中（阅览区）/ 右（详情区）三栏 -->
   <div id="main-row">
 
+    <!-- 最左侧：功能选择区（竖排），右边界中点的三角按钮可展开/隐藏 -->
+    <nav id="nav-rail">
+      <button class="nav-btn" data-section="dashboard" title="当前文库统计总览"><span class="nav-txt">仪表盘</span></button>
+      <button class="nav-btn active" data-section="workbench" title="浏览与维护文库"><span class="nav-txt">文库操作</span></button>
+      <button class="nav-btn" data-section="search" title="按标签 / 分类检索"><span class="nav-txt">搜索</span></button>
+      <button class="nav-btn" data-section="records" title="打开历史记录"><span class="nav-txt">记录</span></button>
+      <button id="nav-toggle" type="button" title="隐藏功能选择区">◀</button>
+    </nav>
+
     <!-- 左：工作区 -->
     <aside id="left-panel">
       <div id="lp-body">
 
-        <!-- 当前文库卡片 -->
-        <section class="lp-sec">
+        <!-- 当前文库卡片（仪表盘） -->
+        <section class="lp-sec" data-section="dashboard">
           <div class="lp-sec-title">当前文库</div>
           <div class="lib-card">
             <div class="lc-top">
@@ -30,6 +39,11 @@
               <div class="lc-stat"><b id="lc-stat-size">–</b><i>总大小</i></div>
             </div>
           </div>
+        </section>
+
+        <!-- 切换 / 新建 / 迁移（文库操作） -->
+        <section class="lp-sec" data-section="workbench">
+          <div class="lp-sec-title">文库管理</div>
           <div class="lp-btn-row">
             <button id="btn-lib-switch" title="在已登记的文库之间切换">切换</button>
             <button id="btn-lib-new" title="新建一个文库">新建</button>
@@ -37,8 +51,8 @@
           </div>
         </section>
 
-        <!-- 检索 -->
-        <section class="lp-sec">
+        <!-- 检索（搜索） -->
+        <section class="lp-sec" data-section="search">
           <div class="lp-sec-title">
             <span>检索当前文库</span>
             <button id="btn-search-mode" title="点击切换检索方式">按标签</button>
@@ -58,8 +72,8 @@
           </div>
         </section>
 
-        <!-- 快捷操作 -->
-        <section class="lp-sec">
+        <!-- 快捷操作（文库操作） -->
+        <section class="lp-sec" data-section="workbench">
           <div class="lp-sec-title">快捷操作</div>
           <div class="lp-btn-row">
             <button id="btn-batch-add" class="batch-btn" title="按批次导入文件或整个文件夹，并统一填写作者 / 标签 / 来源">批量添加</button>
@@ -74,15 +88,15 @@
           </div>
         </section>
 
-        <!-- 文库目录树 -->
-        <section class="lp-sec">
+        <!-- 文库目录树（文库操作） -->
+        <section class="lp-sec" data-section="workbench">
           <div class="lp-sec-title">文库目录</div>
           <div id="lib-tree"></div>
         </section>
       </div>
 
-      <!-- 历史记录 -->
-      <div id="history-box">
+      <!-- 历史记录（记录） -->
+      <div id="history-box" data-section="records">
         <div class="box-title">
           <span>历史记录</span>
           <span class="title-btns">
@@ -96,6 +110,8 @@
 
     <div class="v-splitter" id="split-left" title="拖动调整宽度"></div>
 
+    <!-- 主体舞台：四个功能各占一个，同一时刻只显示一个 -->
+    <div id="stage-workbench" class="stage">
     <!-- 中：阅览区 -->
     <main id="preview-panel">
       <div id="preview-header">
@@ -132,6 +148,22 @@
         <div class="hint">未选择文件</div>
       </div>
     </aside>
+    </div><!-- /#stage-workbench -->
+
+    <!-- 仪表盘：全宽显示当前文库统计（初版） -->
+    <div id="stage-dashboard" class="stage hidden">
+      <div id="dashboard-body" class="stage-body"></div>
+    </div>
+
+    <!-- 搜索：全宽显示搜索功能与结果（初版） -->
+    <div id="stage-search" class="stage hidden">
+      <div id="search-stage-body" class="stage-body"></div>
+    </div>
+
+    <!-- 记录：全宽显示历史记录（初版） -->
+    <div id="stage-records" class="stage hidden">
+      <div id="records-stage-body" class="stage-body"></div>
+    </div>
   </div>
 
   <!-- 右键菜单 -->

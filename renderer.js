@@ -41,6 +41,9 @@ const state = {
   tagLevels: new Set(JSON.parse(localStorage.getItem('fm_tag_levels') || '["lib","cat","group","file"]')),
   libPageNum: 1,                // 大类组网格当前页
   libPreviewFile: null,         // 正在预览的文件（组内或搜索结果）
+  // 左侧功能导航当前区块：dashboard 仪表盘 | workbench 文库操作 | search 搜索 | records 记录
+  // 每次启动都从「文库操作」开始，不记忆上次选择
+  section: 'workbench',
 };
 
 // ---------- 工具函数 ----------
@@ -571,7 +574,125 @@ function renderCurrentView() {
     default: showLibrariesView();
   }
   updateFileNavButtons();
+  // 全宽「搜索」区块与中间检索视图共用筛选状态，需同步刷新结果
+  if (state.section === 'search') renderSearchStage();
 }
+// ---------- 左侧功能导航（仪表盘 / 文库操作 / 搜索 / 记录） ----------
+// 同一时刻只显示一个功能区块：左侧只展开该区块的细分项，主体也只显示对应的舞台。
+// 现有所有按钮 id 都保留，只是按 data-section 归属到不同区块。
+const SECTION_STAGES = {
+  dashboard: '#stage-dashboard', workbench: '#stage-workbench',
+  search: '#stage-search', records: '#stage-records'
+};
+function setSection(name) {
+  if (!SECTION_STAGES[name]) name = 'workbench';
+  state.section = name;
+  document.body.dataset.section = name;
+  // 左侧导航高亮
+  $$('#nav-rail .nav-btn').forEach(b => b.classList.toggle('active', b.dataset.section === name));
+  // 左侧细分项：只显示属于当前区块的 section；历史记录在左栏仅「记录」区块显示
+  $$('#lp-body .lp-sec[data-section]').forEach(sec => sec.classList.toggle('hidden', sec.dataset.section !== name));
+  $('#history-box').classList.toggle('hidden', name !== 'records');
+  // 主体舞台：只显示当前区块
+  Object.entries(SECTION_STAGES).forEach(([key, sel]) => $(sel).classList.toggle('hidden', key !== name));
+  // 各区块自有渲染
+  if (name === 'dashboard') renderDashboard();
+  else if (name === 'records') renderRecordsStage();
+  else if (name === 'search') renderSearchStage();
+  else { renderCurrentView(); renderBreadcrumb(); }
+}
+
+// 仪表盘（全宽初版）：当前文库统计总览
+function renderDashboard() {
+  const box = $('#dashboard-body');
+  if (!box) return;
+  const d = state.libData;
+  if (!d || !state.libRoot) {
+    box.innerHTML = `<div class="stage-empty"><div class="big">📊</div><div>还没有打开的文库</div>
+      <div class="empty-sub">在「文库操作」中新建或切换一个文库后，这里会显示它的统计总览</div></div>`;
+    return;
+  }
+  const groups = d.categories.reduce((s, c) => s + c.groupCount, 0);
+  const files = d.categories.reduce((s, c) => s + c.groups.reduce((g, x) => g + x.fileCount, 0), 0);
+  const size = d.categories.reduce((s, c) => s + c.totalSize, 0);
+  const stat = (n, label, icon) => `<div class="dash-card"><div class="dc-ico">${icon}</div><div class="dc-num">${n}</div><div class="dc-label">${label}</div></div>`;
+  const own = ownMeta('') || {};
+  const tagNames = (own.tags || []).map(t => typeof t === 'string' ? t : t.name);
+  const info = [
+    ['文库名称', escapeHtml(d.name)], ['目录路径', escapeHtml(d.root || '')],
+    ['账本更新', fmtDate(d.updatedAt)],
+    ['作者', (own.author || []).join('、') || '空'],
+    ['来源', (own.source || []).join('、') || '空'],
+    ['标签', tagNames.join('、') || '空']
+  ].map(([k, v]) => `<div class="dash-row"><span class="dr-k">${k}</span><span class="dr-v" title="${v}">${v}</span></div>`).join('');
+  box.innerHTML = `
+    <div class="stage-title"><span>📊 仪表盘</span><span class="stage-sub">当前文库统计总览（初版）</span></div>
+    <div class="dash-stats">
+      ${stat(d.categories.length, '大类', '📁')}${stat(groups, '文件组', '🗂')}
+      ${stat(files, '文件', '📄')}${stat(fmtSize(size), '总大小', '💾')}
+    </div>
+    <div class="stage-panel"><div class="panel-title">基本信息</div><div class="dash-info">${info}</div></div>
+    <div class="stage-hint">提示：点击左侧「文库操作」可浏览大类与文件组，进行日常维护。</div>`;
+}
+
+// 搜索（全宽初版）：复用已有的按标签 / 按分类筛选逻辑，结果与工具条都放在主体区
+function renderSearchStage() {
+  const box = $('#search-stage-body');
+  if (!box) return;
+  const list = Array.isArray(filterInfo.list) ? filterInfo.list : [];
+  const mode = filterInfo.mode || 'plain';
+  const chips = mode === 'tag'
+    ? `<span class="stage-chip active">按标签</span>`
+    : `<span class="stage-chip active">按分类</span>`;
+  const cond = [
+    filterInfo.kw ? '关键词：' + escapeHtml(filterInfo.kw) : null,
+    filterInfo.tag ? '标签：' + escapeHtml(filterInfo.tag) : null,
+    filterInfo.cat !== '全部' ? '分类：' + escapeHtml(filterInfo.cat) : null,
+    mode === 'tag' && filterInfo.levels?.length ? '层级：' + escapeHtml(filterInfo.levels.join('、')) : null
+  ].filter(Boolean).join('　');
+  let rows = '';
+  if (!list.length) {
+    rows = '<div class="stage-empty"><div class="big">🔍</div><div>没有匹配的结果</div><div class="empty-sub">在左侧「搜索」中调整筛选条件，或切换检索方式</div></div>';
+  } else {
+    rows = `<div class="search-results">` + list.map(x => {
+      const name = mode === 'tag' ? x.name : x.file.name;
+      const sub = mode === 'tag' ? x.sub : escapeHtml(x.group.displayName) + ' · ' + fmtSize(x.file.size);
+      const icon = mode === 'tag' ? (x.icon || '📃') : (ICONS[x.file.category] || '📃');
+      const level = mode === 'tag' ? `<span class="res-level">${KIND_LABEL[x.kind] || ''}</span>` : '';
+      return `<div class="res-row"><span class="res-ico">${icon}</span><span class="res-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>${level}<span class="res-sub">${sub}</span></div>`;
+    }).join('') + `</div>`;
+  }
+  box.innerHTML = `
+    <div class="stage-title"><span>🔍 搜索</span><span class="stage-sub">共 ${list.length} 项结果（初版）</span></div>
+    <div class="stage-toolbar">${chips}<span class="toolbar-cond">${cond || '未设置筛选条件'}</span></div>
+    ${rows}`;
+}
+
+// 记录（全宽初版）：打开历史记录
+function renderRecordsStage() {
+  const box = $('#records-stage-body');
+  if (!box) return;
+  const hs = state.openHistory.slice(0, 50);
+  const list = hs.length ? `<div class="records-list">` + hs.map(h =>
+    `<div class="res-row" data-rec="${escapeHtml(h.path)}"><span class="res-ico">${ICONS[h.category] || '📃'}</span>
+      <span class="res-name" title="${escapeHtml(h.path)}">${escapeHtml(h.name)}</span>
+      <span class="res-sub">${escapeHtml(h.path)}</span></div>`).join('') + `</div>`
+    : '<div class="stage-empty"><div class="big">🕘</div><div>暂无记录</div><div class="empty-sub">用系统程序打开过的文件会出现在这里</div></div>';
+  box.innerHTML = `
+    <div class="stage-title"><span>🕘 记录</span><span class="stage-sub">打开历史（初版，共 ${hs.length} 条）</span>
+      <button id="stage-clear-history" class="stage-act">清空</button></div>
+    ${list}`;
+  box.querySelectorAll('[data-rec]').forEach(el => {
+    el.onclick = () => {
+      const h = state.openHistory.find(x => x.path === el.dataset.rec);
+      if (!h) return;
+      openEntry({ path: h.path, name: h.name, isDir: false, category: h.category });
+    };
+  });
+  const clr = $('#stage-clear-history');
+  if (clr) clr.onclick = () => $('#btn-clear-history')?.click();
+}
+
 function libFilterActive() {
   return state.libSearch !== '' || state.libCatFilter !== '全部' || !!state.libTagFilter;
 }
@@ -2487,12 +2608,33 @@ document.addEventListener('keydown', (e) => {
   renderSearchMode();
   buildCatChips();
   renderHistory();
+  // 左侧功能导航绑定（事件委托，导航按钮常驻）
+  $('#nav-rail').addEventListener('click', (e) => {
+    const btn = e.target.closest('.nav-btn');
+    if (btn) setSection(btn.dataset.section);
+  });
+  // 三角按钮：展开 / 隐藏最左侧功能选择区（仅界面状态，不持久化）
+  const navToggle = $('#nav-toggle');
+  const navCollapsed0 = document.body.classList.contains('nav-collapsed');
+  navToggle.textContent = navCollapsed0 ? '▶' : '◀';
+  navToggle.title = navCollapsed0 ? '展开功能选择区' : '隐藏功能选择区';
+  navToggle.addEventListener('click', () => {
+    const collapsed = document.body.classList.toggle('nav-collapsed');
+    navToggle.textContent = collapsed ? '▶' : '◀';
+    navToggle.title = collapsed ? '展开功能选择区' : '隐藏功能选择区';
+  });
   await loadLibList();
   // 启动首屏：中间区域直接显示全部文库
   state.view = 'libs';
   showLibrariesView();
+  // 每次启动都从「文库操作」开始，与旧版界面一致
+  setSection(state.section);
   // 后台静默加载上次使用的文库，供左侧目录与检索直接使用（不抢占首屏）
   if (state.libRoot) {
-    (async () => { await loadLibrary(true); renderBreadcrumb(); })();
+    (async () => {
+      await loadLibrary(true);
+      renderBreadcrumb();
+      if (state.section === 'dashboard') renderDashboard();
+    })();
   }
 })();
