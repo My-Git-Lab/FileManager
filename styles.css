@@ -1312,3 +1312,43 @@ body.nav-collapsed #nav-toggle {
 
 /* 「记录」区块时让左侧历史列表占满可用高度 */
 body[data-section="records"] #history-box { flex: 1 1 auto; max-height: none; }
+
+/* 仪表盘标签墙（v0.4.1） */
+#tag-wall-body.tw-loading { color: var(--text-sub); font-size: var(--fs-sm); padding: 18px 0; text-align: center; }
+.tw-grid { display: flex; flex-direction: column; gap: 10px; }
+.tw-row { display: flex; flex-wrap: wrap; gap: 8px 12px; }
+.tw-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 12px; border-radius: 18px;
+  border: 1px solid var(--tw-c, var(--border));
+  color: var(--tw-c, var(--text)); background: var(--panel-2);
+  font-size: var(--fs-base);
+}
+.tw-chip i { font-style: normal; font-size: var(--fs-xs); color: var(--text-weak); }
+.tw-cloud { display: flex; justify-content: center; width: 100%; margin: 10px auto 0; }
+/* 爱心词云容器适度放大；container-type 让内部 cqw 字号随容器等比缩放，保证布局与显示一致 */
+.tw-heart { position: relative; width: min(100%, 680px); aspect-ratio: 1 / 1; container-type: inline-size; }
+.tw-heart-outline {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  pointer-events: none; overflow: visible;
+}
+.tw-heart-outline path {
+  fill: rgba(255, 122, 162, .10);
+  stroke: #ff7aa2;
+  stroke-width: .9;
+  stroke-linejoin: round;
+}
+.tw-word {
+  position: absolute; transform: translate(-50%, -50%);
+  white-space: nowrap; line-height: 1; font-weight: var(--fw-strong);
+  text-shadow: 0 1px 2px rgba(0,0,0,.12); cursor: default;
+}
+.tw-word:hover { filter: brightness(1.15); z-index: 2; }
+/* 标签墙条目可点击：跳转到搜索功能区并检索该标签 */
+.tw-chip.tw-clickable, .tw-word.tw-clickable { cursor: pointer; }
+.tw-chip.tw-clickable:hover { border-color: var(--accent); box-shadow: 0 1px 4px rgba(47,111,237,.18); }
+.tw-word.tw-clickable:hover { text-decoration: underline; }
+
+/* 仪表盘为全宽舞台：隐藏左侧工作区与分隔条，让统计与标签墙占满空间 */
+body[data-section="dashboard"] #left-panel,
+body[data-section="dashboard"] #split-left { display: none; }

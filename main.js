@@ -856,18 +856,75 @@ function cleanTagNames(list) {
   }
   return out.sort(tagCompare);
 }
-function readTagBank(root) {
+// 读取标签库文件：兼容旧版（纯数组 / {version:1,tags:[]}），返回 { names, counts }。
+// counts[标签名] = 该文库里「拥有」此标签的文件数（v0.4.1 起随文库一起记录）。
+function readTagBankFull(root) {
   try {
     const raw = JSON.parse(fss.readFileSync(tagBankPath(root), 'utf8'));
     const arr = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.tags) ? raw.tags : []);
-    return cleanTagNames(arr);
-  } catch { return []; }            // 不存在 / 损坏 / 旧格式：一律按空库处理
+    const names = cleanTagNames(arr);
+    const counts = {};
+    if (raw && raw.counts && typeof raw.counts === 'object' && !Array.isArray(raw.counts)) {
+      for (const n of names) counts[n] = Math.max(0, Number(raw.counts[n]) || 0);
+    }
+    return { names, counts };
+  } catch { return { names: [], counts: {} }; }   // 不存在 / 损坏 / 旧格式：按空库处理
+}
+function readTagBank(root) { return readTagBankFull(root).names; }
+
+// 一个文件的「继承链」键：'' → 大类 → 大类/组 → 大类/组/文件（与渲染层 metaChain 一致）
+function chainKeys(rel) {
+  const out = [''];
+  let cur = '';
+  for (const p of String(rel || '').split('/').filter(Boolean)) {
+    cur = cur ? cur + '/' + p : p;
+    out.push(cur);
+  }
+  return out;
+}
+// 从账本算出：names = 四个层级出现过的标签并集；counts = 每个标签被多少文件拥有。
+// 「拥有」按继承链判定：文件自身或其所属的组 / 大类 / 文库任一级带此标签，即计入该文件（每个文件只计一次）。
+async function ledgerTagData(root, strict) {
+  let led;
+  try { led = await readLedger(path.join(root, '.library-index.json'), root); }
+  catch { return strict ? null : { names: [], counts: {} }; }  // 账本不可读：严格模式交给调用方回退
+  const mm = metaFromLedger(led, root);
+  const nameSet = new Set();
+  const counts = {};
+  for (const m of Object.values(mm))
+    for (const t of (m.tags || [])) {
+      const n = typeof t === 'string' ? t : (t && t.name);
+      if (n) nameSet.add(n);
+    }
+  for (const c of (led.categories || [])) {
+    for (const g of (c.groups || [])) {
+      for (const f of (g.files || [])) {
+        const owned = new Set();
+        for (const key of chainKeys(relKey(root, f.path))) {
+          const m = mm[key];
+          if (!m) continue;
+          for (const t of (m.tags || [])) {
+            const n = typeof t === 'string' ? t : (t && t.name);
+            if (n) owned.add(n);
+          }
+        }
+        for (const n of owned) counts[n] = (counts[n] || 0) + 1;
+      }
+    }
+  }
+  return { names: cleanTagNames([...nameSet]), counts };
+}
+async function ledgerTagNames(root, strict) {
+  const d = await ledgerTagData(root, strict);
+  return d ? d.names : null;
 }
 // 先写临时文件再改名，避免程序被强关时留下半个 JSON；个别环境不允许覆盖时退回直接写。
-async function writeTagBank(root, names) {
+async function writeTagBank(root, names, counts) {
   const clean = cleanTagNames(names);       // 统一按名称排序，与添加顺序无关
+  const cleanCounts = {};
+  for (const n of clean) cleanCounts[n] = Math.max(0, Number(counts && counts[n]) || 0);
   const dest = tagBankPath(root), tmp = dest + '.tmp';
-  const payload = JSON.stringify({ version: 1, tags: clean }, null, 2);
+  const payload = JSON.stringify({ version: 2, tags: clean, counts: cleanCounts }, null, 2);
   // 内容没变就不写：刷新标签库时避免无谓的磁盘写入
   try { if (fss.readFileSync(dest, 'utf8') === payload) return clean; } catch {}
   await fs.writeFile(tmp, payload);
@@ -879,21 +936,11 @@ async function writeTagBank(root, names) {
   }
   return clean;
 }
-// 从账本收集四个层级（文库 / 大类 / 组 / 文件）自己填过的所有标签
-async function ledgerTagNames(root, strict) {
-  let led;
-  try { led = await readLedger(path.join(root, '.library-index.json'), root); }
-  catch { return strict ? null : []; }    // 账本不可读：严格模式交给调用方回退到标签库
-  const names = [];
-  for (const m of Object.values(metaFromLedger(led, root)))
-    for (const t of (m.tags || [])) names.push(typeof t === 'string' ? t : t.name);
-  return cleanTagNames(names);
-}
-// 标签库 = 账本里「当前仍然存在」的标签快照：从某一层级删掉标签后，
-// 只要全库再没有别的层级用它，这个词就会从标签库消失，不再留作历史候选。
+// 标签库 = 账本里「当前仍然存在」的标签快照：删掉某级标签后若全库不再使用即从库里消失。
+// v0.4.1 起同时记录每个标签被多少文件拥有，供仪表盘标签墙按文件数决定字号。
 async function syncTagBank(root) {
-  const names = await ledgerTagNames(root);
-  return writeTagBank(root, names);
+  const data = await ledgerTagData(root);
+  return writeTagBank(root, data.names, data.counts);
 }
 // 标签库只是辅助功能：写失败只记日志，绝不影响标签本身已经保存成功的主流程。
 async function bestEffortSyncTagBank(root) {
@@ -1095,6 +1142,79 @@ ipcMain.handle('lib:tagBanks', async () => {
     .sort((a, b) => tagCompare(a[0], b[0]))
     .map(([name, ls]) => ({ name, libs: [...ls].sort(tagCompare) }));
   return { tags };
+});
+
+// 仪表盘标签墙：所有文库「当前存在」标签的并集，每个标签附跨库文件总数。
+// 真源是各文库账本（按继承链现算文件数），账本损坏才回退到随文库存放的标签库快照。
+// 顺手把各库标签库刷新为当前值；只读聚合，不改动任何标签本身。
+ipcMain.handle('lib:tagWall', async () => {
+  const map = new Map();                    // 标签名 -> { count, libs:Set }
+  let libs = [];
+  try { libs = readRegistry().libraries || []; } catch {}
+  for (const lib of libs) {
+    const root = lib.path;
+    if (!root || !fss.existsSync(root) || !isAllowed(root)) continue;
+    let data;
+    try {
+      data = await ledgerTagData(root, true);
+      if (data === null) data = readTagBankFull(root);  // 账本损坏：回退快照
+      else await bestEffortSyncTagBank(root);           // 顺手刷新快照（含文件数）
+    } catch { data = readTagBankFull(root); }
+    const label = lib.name || path.basename(root);
+    for (const n of cleanTagNames(data.names)) {
+      if (!map.has(n)) map.set(n, { count: 0, libs: new Set() });
+      const e = map.get(n);
+      e.count += data.counts[n] || 0;
+      e.libs.add(label);
+    }
+  }
+  const tags = [...map.entries()]
+    .sort((a, b) => tagCompare(a[0], b[0]))
+    .map(([name, v]) => ({ name, fileCount: v.count, libs: [...v.libs].sort(tagCompare) }));
+  return { tags };
+});
+
+// 跨文库标签检索：仪表盘标签墙点击某标签后，返回全部文库中命中它的条目。
+// 命中口径与库内标签检索一致：沿 文库→大类→组→文件 的继承链，任一级带此标签即算命中。
+// 每条结果带来源文库名（libName），便于跨库同名对象区分。只读，不改动任何账本。
+ipcMain.handle('lib:searchTag', async (e, { tag } = {}) => {
+  const name = String(tag == null ? '' : tag).trim();
+  if (!name) return { tag: name, list: [] };
+  const out = [];
+  let libs = [];
+  try { libs = readRegistry().libraries || []; } catch {}
+  for (const lib of libs) {
+    const root = lib.path;
+    if (!root || !fss.existsSync(root) || !isAllowed(root)) continue;
+    let led;
+    try { led = await readLedger(path.join(root, '.library-index.json'), root); }
+    catch { continue; }
+    const libName = lib.name || path.basename(root);
+    const mm = metaFromLedger(led, root);
+    const hit = (p) => {
+      for (const key of chainKeys(relKey(root, p))) {
+        const m = mm[key];
+        if (!m) continue;
+        for (const t of (m.tags || [])) {
+          if ((typeof t === 'string' ? t : (t && t.name)) === name) return true;
+        }
+      }
+      return false;
+    };
+    if (hit(root)) out.push({ kind: 'lib', name: libName, path: root, libName, sub: '' });
+    for (const c of (led.categories || [])) {
+      if (hit(c.path)) out.push({ kind: 'cat', name: c.name || path.basename(c.path), path: c.path, libName, sub: '' });
+      for (const g of (c.groups || [])) {
+        if (hit(g.path)) out.push({ kind: 'group', name: g.displayName || g.name || path.basename(g.path), path: g.path, libName, sub: '' });
+        for (const f of (g.files || [])) {
+          if (hit(f.path)) out.push({ kind: 'file', name: f.name || path.basename(f.path), path: f.path, libName, category: f.category, size: f.size || 0, sub: '' });
+        }
+      }
+    }
+  }
+  const order = { lib: 0, cat: 1, group: 2, file: 3 };
+  out.sort((a, b) => (order[a.kind] - order[b.kind]) || tagCompare(a.libName, b.libName) || tagCompare(a.name, b.name));
+  return { tag: name, list: out };
 });
 
 // 文库列表（注册表内容 + 是否仍存在于磁盘）

@@ -602,39 +602,176 @@ function setSection(name) {
   else { renderCurrentView(); renderBreadcrumb(); }
 }
 
-// 仪表盘（全宽初版）：当前文库统计总览
+// 仪表盘标签墙点击某标签：跨库检索该标签，切换到「搜索」功能区展示结果。
+async function searchTagFromWall(tag) {
+  tag = String(tag == null ? '' : tag).trim();
+  if (!tag) return;
+  if (typeof window.api.libSearchTag !== 'function') { toast('当前版本不支持跨库标签检索'); return; }
+  let res;
+  try { res = await window.api.libSearchTag(tag); }
+  catch (err) { toast('标签检索失败：' + (err && err.message || err)); return; }
+  const raw = (res && Array.isArray(res.list)) ? res.list : [];
+  // 映射成搜索结果项结构，并补上来源文库，便于跨库同名对象区分
+  const list = raw.map(x => {
+    const kind = x.kind || 'file';
+    const icon = kind === 'lib' ? '📚' : kind === 'cat' ? '📁' : kind === 'group' ? '🗂'
+      : (ICONS[x.category] || '📃');
+    const loc = x.libName ? x.libName : '';
+    return {
+      kind, name: x.name, path: x.path, icon,
+      sub: [loc, kind === 'file' && x.size != null ? fmtSize(x.size) : ''].filter(Boolean).join(' · ')
+    };
+  });
+  filterInfo = { list, kw: '', cat: '全部', tag, levels: [], mode: 'tag', crossLib: true };
+  setSection('search');
+}
+
+// 仪表盘：全部文库统计之和 + 标签墙（标签并集）
 function renderDashboard() {
   const box = $('#dashboard-body');
   if (!box) return;
-  const d = state.libData;
-  if (!d || !state.libRoot) {
-    box.innerHTML = `<div class="stage-empty"><div class="big">📊</div><div>还没有打开的文库</div>
-      <div class="empty-sub">在「文库操作」中新建或切换一个文库后，这里会显示它的统计总览</div></div>`;
+  const libs = Array.isArray(state.libLibraries) ? state.libLibraries : [];
+  const cats = libs.reduce((s, l) => s + (l.catCount || 0), 0);
+  const groups = libs.reduce((s, l) => s + (l.groupCount || 0), 0);
+  const files = libs.reduce((s, l) => s + (l.fileCount || 0), 0);
+  const size = libs.reduce((s, l) => s + (l.totalSize || 0), 0);
+  const stat = (n, label, icon) => `<div class="dash-card"><div class="dc-ico">${icon}</div><div class="dc-num">${n}</div><div class="dc-label">${label}</div></div>`;
+  const head = `
+    <div class="stage-title"><span>📊 仪表盘</span><span class="stage-sub">全部 ${libs.length} 个文库之和</span></div>
+    <div class="dash-stats">
+      ${stat(cats, '大类', '📁')}${stat(groups, '文件组', '🗂')}
+      ${stat(files, '文件', '📄')}${stat(fmtSize(size), '总大小', '💾')}
+    </div>`;
+  if (!libs.length) {
+    box.innerHTML = head + `<div class="stage-empty"><div class="big">📊</div><div>还没有文库</div>
+      <div class="empty-sub">在「文库操作」中新建文库后，这里会汇总全部文库的统计与标签墙</div></div>`;
     return;
   }
-  const groups = d.categories.reduce((s, c) => s + c.groupCount, 0);
-  const files = d.categories.reduce((s, c) => s + c.groups.reduce((g, x) => g + x.fileCount, 0), 0);
-  const size = d.categories.reduce((s, c) => s + c.totalSize, 0);
-  const stat = (n, label, icon) => `<div class="dash-card"><div class="dc-ico">${icon}</div><div class="dc-num">${n}</div><div class="dc-label">${label}</div></div>`;
-  const own = ownMeta('') || {};
-  const tagNames = (own.tags || []).map(t => typeof t === 'string' ? t : t.name);
-  const info = [
-    ['文库名称', escapeHtml(d.name)], ['目录路径', escapeHtml(d.root || '')],
-    ['账本更新', fmtDate(d.updatedAt)],
-    ['作者', (own.author || []).join('、') || '空'],
-    ['来源', (own.source || []).join('、') || '空'],
-    ['标签', tagNames.join('、') || '空']
-  ].map(([k, v]) => `<div class="dash-row"><span class="dr-k">${k}</span><span class="dr-v" title="${v}">${v}</span></div>`).join('');
-  box.innerHTML = `
-    <div class="stage-title"><span>📊 仪表盘</span><span class="stage-sub">当前文库统计总览（初版）</span></div>
-    <div class="dash-stats">
-      ${stat(d.categories.length, '大类', '📁')}${stat(groups, '文件组', '🗂')}
-      ${stat(files, '文件', '📄')}${stat(fmtSize(size), '总大小', '💾')}
-    </div>
-    <div class="stage-panel"><div class="panel-title">基本信息</div><div class="dash-info">${info}</div></div>
-    <div class="stage-hint">提示：点击左侧「文库操作」可浏览大类与文件组，进行日常维护。</div>`;
+  box.innerHTML = head + `<div class="stage-panel"><div class="panel-title">🏷 标签墙</div><div id="tag-wall-body" class="tw-loading">正在汇总标签…</div></div>
+    <div class="stage-hint">统计为全部文库之和；标签墙显示所有文库标签并集，字号随拥有该标签的文件数增大。</div>`;
+  // 标签墙数据来自主进程（跨文库并集 + 文件数），异步填充，失败时给出可读提示
+  if (typeof window.api.libTagWall !== 'function') {
+    const ph = $('#tag-wall-body'); if (ph) ph.innerHTML = '<div class="stage-empty"><div class="big">🏷</div><div>当前版本不支持标签墙数据</div></div>';
+    return;
+  }
+  window.api.libTagWall().then(res => {
+    const ph = $('#tag-wall-body');
+    if (!ph) return;
+    const tags = (res && Array.isArray(res.tags)) ? res.tags : [];
+    ph.className = '';
+    ph.innerHTML = buildTagWall(tags);
+    // 点击任意标签：跨库检索该标签并跳转到「搜索」功能区展示结果（事件委托）
+    ph.querySelectorAll('.tw-clickable').forEach(el => {
+      el.setAttribute('role', 'button');
+      el.tabIndex = 0;
+      const go = () => searchTagFromWall(el.getAttribute('data-tag') || '');
+      el.addEventListener('click', go);
+      el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } });
+    });
+  }).catch(err => {
+    const ph = $('#tag-wall-body');
+    if (ph) { ph.className = ''; ph.innerHTML = '<div class="stage-empty"><div class="big">🏷</div><div>标签加载失败</div><div class="empty-sub">' + escapeHtml(String(err && err.message || err)) + '</div></div>'; }
+  });
 }
 
+// 标签墙：≤10 个标签分两行平铺；>10 个组成爱心词云，字号按文件数
+function buildTagWall(tags) {
+  if (!tags.length) return '<div class="stage-empty"><div class="big">🏷</div><div>还没有任何标签</div><div class="empty-sub">给文库 / 大类 / 组 / 文件打上标签后，这里会汇总展示</div></div>';
+  if (tags.length <= 10) {
+    const half = Math.ceil(tags.length / 2);
+    const row = arr => arr.map(t => tagWallChip(t)).join('');
+    return `<div class="tw-grid two-rows"><div class="tw-row">${row(tags.slice(0, half))}</div><div class="tw-row">${row(tags.slice(half))}</div></div>`;
+  }
+  return tagHeartCloud(tags);
+}
+function tagWallChip(t) {
+  const name = String(t.name || '');
+  const c = metaTagColor(name);
+  const n = Number(t.fileCount) || 0;
+  return `<span class="tw-chip tw-clickable" data-tag="${escapeHtml(name)}" style="--tw-c:${c}" title="${escapeHtml(name)}：${n} 个文件">${escapeHtml(name)}<i>${n}</i></span>`;
+}
+// 爱心词云：先用参数方程画出可见爱心轮廓，再把标签名称放进轮廓内部（同一坐标系）
+// 参数方程：x=16sin³t，y=13cos t−5cos2t−2cos3t−cos4t（数学坐标 y 向上），映射为容器 0~100 百分比坐标
+const HEART_K = 2.4, HEART_CX = 50, HEART_CY = 50;
+function heartParam(t) {
+  const hx = 16 * Math.pow(Math.sin(t), 3);
+  const hy = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+  return { x: HEART_CX + hx * HEART_K, y: HEART_CY - hy * HEART_K };
+}
+// 爱心轮廓采样点（0~100 容器百分比坐标），轮廓绘制与文字布局共用同一组点
+function heartPolygon(N) {
+  N = N || 120;
+  const pts = [];
+  for (let i = 0; i < N; i++) pts.push(heartParam(i / N * Math.PI * 2));
+  return pts;
+}
+// 射线法：判断点是否落在爱心内部（含边界近似）
+function pointInHeart(x, y, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    if ((a.y > y) !== (b.y > y) && x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+// 标签文字宽度（相对容器宽度的百分比）：中文按 1em，ASCII 按 0.56em
+function tagTextWidthPct(name, fsPct) {
+  let em = 0;
+  for (const ch of String(name)) em += /[\x00-\xff]/.test(ch) ? 0.56 : 1;
+  return em * fsPct;
+}
+// 爱心轮廓 SVG path
+function heartOutlinePath() {
+  const parts = heartPolygon(120).map((p, i) => (i ? 'L' : 'M') + p.x.toFixed(2) + ' ' + p.y.toFixed(2));
+  return parts.join(' ') + ' Z';
+}
+// 爱心词云：先画可见轮廓，再把标签放进爱心内部。字号大的先放、靠近中心，逐个避开已占区域，
+// 并保证整段文字的四角都在爱心内（不会越界），尽量互不重叠。
+function tagHeartCloud(tags) {
+  const counts = tags.map(t => Number(t.fileCount) || 0);
+  const max = Math.max(1, ...counts), min = Math.min(...counts);
+  const span = Math.max(1, max - min);
+  const items = tags.map((t, i) => ({
+    name: String(t.name || ''), n: counts[i],
+    fs: 2.2 + (counts[i] - min) / span * 3.6   // 2.2~5.8 cqw，随容器等比缩放；文件越多越大
+  }));
+  const poly = heartPolygon(120);
+  // 候选网格：按到中心的距离由内向外，保证大标签靠中心、小标签向外铺开
+  const grid = [];
+  for (let y = 24; y <= 90; y += 2)
+    for (let x = 14; x <= 86; x += 2)
+      grid.push({ x, y, d: Math.hypot((x - 50), (y - 55) * 0.9) });
+  grid.sort((a, b) => a.d - b.d || a.x - b.x || a.y - b.y);
+  const insideBox = (p, hw, hh) => {
+    for (const sx of [-1, 1]) for (const sy of [-1, 1])
+      if (!pointInHeart(p.x + sx * hw, p.y + sy * hh, poly)) return false;
+    return true;
+  };
+  const placed = [], pos = new Array(items.length);
+  const order = items.map((_, i) => i)
+    .sort((a, b) => items[b].fs - items[a].fs || tagCompare(items[a].name, items[b].name));
+  for (const i of order) {
+    const it = items[i];
+    const hw = tagTextWidthPct(it.name, it.fs) / 2;
+    const hh = Math.max(1.4, it.fs * 0.55);
+    // 首选：四角都在爱心内且与已放文字不重叠
+    let pick = grid.find(p => insideBox(p, hw, hh) &&
+      !placed.some(q => Math.abs(q.x - p.x) < q.hw + hw + 0.8 && Math.abs(q.y - p.y) < q.hh + hh + 0.5));
+    // 退化：只要求在爱心内，允许轻微重叠
+    if (!pick) pick = grid.find(p => insideBox(p, hw, hh));
+    if (!pick) pick = { x: 50, y: 55 };
+    placed.push({ x: pick.x, y: pick.y, hw, hh });
+    pos[i] = pick;
+  }
+  const words = items.map((it, i) => {
+    const p = pos[i], c = metaTagColor(it.name);
+    return `<span class="tw-word tw-clickable" data-tag="${escapeHtml(it.name)}" style="left:${p.x.toFixed(2)}%;top:${p.y.toFixed(2)}%;font-size:${it.fs.toFixed(2)}cqw;color:${c}" title="${escapeHtml(it.name)}：${it.n} 个文件">${escapeHtml(it.name)}</span>`;
+  }).join('');
+  return `<div class="tw-cloud"><div class="tw-heart">
+    <svg class="tw-heart-outline" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><path d="${heartOutlinePath()}"/></svg>
+    ${words}
+  </div></div>`;
+}
 // 搜索（全宽初版）：复用已有的按标签 / 按分类筛选逻辑，结果与工具条都放在主体区
 function renderSearchStage() {
   const box = $('#search-stage-body');
@@ -650,22 +787,31 @@ function renderSearchStage() {
     filterInfo.cat !== '全部' ? '分类：' + escapeHtml(filterInfo.cat) : null,
     mode === 'tag' && filterInfo.levels?.length ? '层级：' + escapeHtml(filterInfo.levels.join('、')) : null
   ].filter(Boolean).join('　');
+  const crossLib = !!filterInfo.crossLib;
   let rows = '';
   if (!list.length) {
     rows = '<div class="stage-empty"><div class="big">🔍</div><div>没有匹配的结果</div><div class="empty-sub">在左侧「搜索」中调整筛选条件，或切换检索方式</div></div>';
   } else {
     rows = `<div class="search-results">` + list.map(x => {
       const name = mode === 'tag' ? x.name : x.file.name;
-      const sub = mode === 'tag' ? x.sub : escapeHtml(x.group.displayName) + ' · ' + fmtSize(x.file.size);
+      const sub = mode === 'tag' ? (crossLib ? escapeHtml(x.sub || '') : x.sub)
+        : escapeHtml(x.group.displayName) + ' · ' + fmtSize(x.file.size);
       const icon = mode === 'tag' ? (x.icon || '📃') : (ICONS[x.file.category] || '📃');
       const level = mode === 'tag' ? `<span class="res-level">${KIND_LABEL[x.kind] || ''}</span>` : '';
-      return `<div class="res-row"><span class="res-ico">${icon}</span><span class="res-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>${level}<span class="res-sub">${sub}</span></div>`;
+      const dp = crossLib && x.path && x.kind === 'file' ? ` data-path="${escapeHtml(x.path)}"` : '';
+      return `<div class="res-row"${dp}><span class="res-ico">${icon}</span><span class="res-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>${level}<span class="res-sub">${sub}</span></div>`;
     }).join('') + `</div>`;
   }
   box.innerHTML = `
-    <div class="stage-title"><span>🔍 搜索</span><span class="stage-sub">共 ${list.length} 项结果（初版）</span></div>
-    <div class="stage-toolbar">${chips}<span class="toolbar-cond">${cond || '未设置筛选条件'}</span></div>
+    <div class="stage-title"><span>🔍 搜索</span><span class="stage-sub">共 ${list.length} 项结果${crossLib ? '（全部文库）' : '（初版）'}</span></div>
+    <div class="stage-toolbar">${chips}${crossLib ? '<span class="stage-chip">跨文库</span>' : ''}<span class="toolbar-cond">${cond || '未设置筛选条件'}</span></div>
     ${rows}`;
+  if (crossLib) {
+    box.querySelectorAll('[data-path]').forEach(el => {
+      el.title = '双击打开：' + el.dataset.path;
+      el.ondblclick = () => openEntry({ path: el.dataset.path, name: el.querySelector('.res-name')?.textContent || '', isDir: false });
+    });
+  }
 }
 
 // 记录（全宽初版）：打开历史记录
