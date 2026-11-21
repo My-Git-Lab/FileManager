@@ -28,8 +28,11 @@ contextBridge.exposeInMainWorld('api', {
   libSetMeta: (root, rel, level, patch) =>
     ipcRenderer.invoke('lib:setMeta', { root, rel, level, patch }),
   libTagBanks: () => ipcRenderer.invoke('lib:tagBanks'),
+  libAuthorBanks: () => ipcRenderer.invoke('lib:authorBanks'),
   libTagWall: () => ipcRenderer.invoke('lib:tagWall'),
+  libAuthorWall: () => ipcRenderer.invoke('lib:authorWall'),
   libSearchTag: (tag) => ipcRenderer.invoke('lib:searchTag', { tag }),
+  libSearchAuthor: (author) => ipcRenderer.invoke('lib:searchAuthor', { author }),
   libSetCover: (root, groupPath, cover) =>
     ipcRenderer.invoke('lib:setCover', { root, groupPath, cover }),
   libLocations: () => ipcRenderer.invoke('lib:locations'),

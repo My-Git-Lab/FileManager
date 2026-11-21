@@ -681,11 +681,12 @@ function tagCompare(a, b) {
   return x.localeCompare(y, 'zh', { numeric: true }) || (x < y ? -1 : x > y ? 1 : 0);
 }
 
-// ---------- 层级元数据：文库 / 大类 / 组 / 文件共用的「作者 / 标签 / 来源」 ----------
-// 键是相对文库根目录的路径：''=文库本身，'大类'=大类，'大类/组'=组，'大类/组/文件'=文件。
-// 作者与来源用字符串数组（可多值），标签用 {name,color} 数组；文件层级只保留标签。
-// 上级的非空信息由渲染层在显示时向下合并，账本里只存每一级「自己填的值」。
-function emptyMeta() { return { author: [], tags: [], source: [] }; }
+// ---------- 维护信息：只属于「组」这一层级（作者 / 标签） ----------
+// v0.4.2 起：文库 / 大类 / 文件都不再拥有维护信息，也没有继承关系。
+// 账本 meta 只存组级键（'大类/组'）；读旧账本时把原继承链上的上级 / 文件级
+// 信息一次性合并到对应组，避免升级后丢失用户已经填过的内容。
+// 作者用字符串数组（可多值），标签用 {name,color} 数组。
+function emptyMeta() { return { author: [], tags: [] }; }
 function levelOfRel(rel) {
   const n = rel ? String(rel).split('/').filter(Boolean).length : 0;
   return n === 0 ? 'lib' : n === 1 ? 'cat' : n === 2 ? 'group' : 'file';
@@ -712,57 +713,70 @@ function safeTagColor(c, name) {
   const hex = s.startsWith('#') ? s.slice(1) : '';
   return /^[0-9a-fA-F]+$/.test(hex) && [3, 4, 6, 8].includes(hex.length) ? s : tagColor(name);
 }
-function normMeta(raw, rel) {
+function normMeta(raw) {
   const m = emptyMeta();
   if (!raw || typeof raw !== 'object') return m;
-  if (levelOfRel(rel) !== 'file') {
-    m.author = metaList(raw.author);
-    m.source = metaList(raw.source);
-  }
+  m.author = metaList(raw.author);
   m.tags = mergeTags([], raw.tags);
   return m;
 }
-function normMetaMap(raw) {
+// 把任意来源的信息统一归到「组」这一级：文件级键并入所属组；旧账本里
+// 文库 / 大类级的信息（已废弃的继承数据）合并到该范围内每个组，避免升级丢数据。
+// groupRels 是账本里现存的组 rel 集合；缺省时从键里推断组级键。
+function normMetaMap(raw, groupRels) {
   const out = {};
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
-  for (const [rel, v] of Object.entries(raw)) {
-    const m = normMeta(v, rel);
-    if (m.author.length || m.source.length || m.tags.length) out[rel] = m;
+  const addTo = (rel, src) => {
+    const m = normMeta(src);
+    if (!m.author.length && !m.tags.length) return;
+    const cur = out[rel] || emptyMeta();
+    cur.author = [...new Set([...cur.author, ...m.author])];
+    cur.tags = mergeTags(cur.tags, m.tags);
+    out[rel] = cur;
+  };
+  const groups = (groupRels && groupRels.size) ? [...groupRels]
+    : [...new Set(Object.keys(raw).filter(k => levelOfRel(k) === 'group'))];
+  for (const [key, v] of Object.entries(raw)) {
+    const lv = levelOfRel(key);
+    if (lv === 'group') addTo(key, v);
+    else if (lv === 'file') {
+      const gr = key.split('/').slice(0, 2).join('/');
+      if (gr) addTo(gr, v);
+    } else {
+      for (const gr of groups)
+        if (!key || gr === key || gr.startsWith(key + '/')) addTo(gr, v);
+    }
   }
   return out;
 }
-// 从账本读取 meta：新版直接读 meta；旧版（组标签 + fileMeta）一次性迁移，文件级作者/来源上提到所属组
+// 从账本读取 meta，结果只含组级键。新版读 meta；旧版（组标签 + fileMeta）一并归并到组。
 function metaFromLedger(led, root) {
+  const cats = (led && led.categories) || [];
+  const base = led && led.root ? led.root : root;
+  const groupRels = new Set();
+  for (const c of cats)
+    for (const g of (c.groups || []))
+      if (g.path) groupRels.add(relKey(base, g.path));
   if (led && led.meta && typeof led.meta === 'object' && !Array.isArray(led.meta))
-    return normMetaMap(led.meta);
-  const out = {};
-  for (const c of ((led && led.categories) || [])) {
+    return normMetaMap(led.meta, groupRels);
+  const raw = {};
+  for (const c of cats) {
     for (const g of (c.groups || [])) {
       if (!(g.tags || []).length) continue;
-      const rel = relKey(led.root || root, g.path);
-      const cur = out[rel] || emptyMeta();
+      const rel = relKey(base, g.path);
+      const cur = raw[rel] || emptyMeta();
       cur.tags = mergeTags(cur.tags, g.tags);
-      out[rel] = cur;
+      raw[rel] = cur;
     }
   }
   const fm = (led && led.fileMeta && typeof led.fileMeta === 'object' && !Array.isArray(led.fileMeta))
     ? led.fileMeta : {};
-  for (const [rel, v] of Object.entries(fm)) {
-    const parts = String(rel).split('/').filter(Boolean);
-    if (parts.length < 3) continue;                 // 文件级信息一律上提到所属组
-    const gr = parts.slice(0, 2).join('/');
-    const src = normMeta(v, gr);
-    const cur = out[gr] || emptyMeta();
-    cur.author = [...new Set([...cur.author, ...src.author])];
-    cur.source = [...new Set([...cur.source, ...src.source])];
-    cur.tags = mergeTags(cur.tags, src.tags);
-    out[gr] = cur;
-  }
-  return out;
+  for (const [rel, v] of Object.entries(fm)) raw[rel] = v;
+  return normMetaMap(raw, groupRels);
 }
 function persistMeta(led, mm) {
-  led.meta = mm;
-  led.metaVersion = 2;
+  led.meta = mm;                                  // 只含组级键，无来源字段
+  led.metaVersion = 3;
   delete led.fileMeta;                            // 旧格式不再保留
   return led;
 }
@@ -857,7 +871,7 @@ function cleanTagNames(list) {
   return out.sort(tagCompare);
 }
 // 读取标签库文件：兼容旧版（纯数组 / {version:1,tags:[]}），返回 { names, counts }。
-// counts[标签名] = 该文库里「拥有」此标签的文件数（v0.4.1 起随文库一起记录）。
+// counts[标签名] = 该文库里「拥有」此标签的文件组数（随文库一起记录）。
 function readTagBankFull(root) {
   try {
     const raw = JSON.parse(fss.readFileSync(tagBankPath(root), 'utf8'));
@@ -872,18 +886,8 @@ function readTagBankFull(root) {
 }
 function readTagBank(root) { return readTagBankFull(root).names; }
 
-// 一个文件的「继承链」键：'' → 大类 → 大类/组 → 大类/组/文件（与渲染层 metaChain 一致）
-function chainKeys(rel) {
-  const out = [''];
-  let cur = '';
-  for (const p of String(rel || '').split('/').filter(Boolean)) {
-    cur = cur ? cur + '/' + p : p;
-    out.push(cur);
-  }
-  return out;
-}
-// 从账本算出：names = 四个层级出现过的标签并集；counts = 每个标签被多少文件拥有。
-// 「拥有」按继承链判定：文件自身或其所属的组 / 大类 / 文库任一级带此标签，即计入该文件（每个文件只计一次）。
+// 从账本算出：names = 各组现存标签的并集；counts = 每个标签被多少个「组」拥有。
+// v0.4.2 后维护信息只在组级，meta 的每个键就是一个组，直接按组统计即可（同组同名标签只计一次）。
 async function ledgerTagData(root, strict) {
   let led;
   try { led = await readLedger(path.join(root, '.library-index.json'), root); }
@@ -891,26 +895,13 @@ async function ledgerTagData(root, strict) {
   const mm = metaFromLedger(led, root);
   const nameSet = new Set();
   const counts = {};
-  for (const m of Object.values(mm))
+  for (const m of Object.values(mm)) {
+    const inGroup = new Set();                     // 同一个组内同名标签去重
     for (const t of (m.tags || [])) {
       const n = typeof t === 'string' ? t : (t && t.name);
-      if (n) nameSet.add(n);
+      if (n) { nameSet.add(n); inGroup.add(n); }
     }
-  for (const c of (led.categories || [])) {
-    for (const g of (c.groups || [])) {
-      for (const f of (g.files || [])) {
-        const owned = new Set();
-        for (const key of chainKeys(relKey(root, f.path))) {
-          const m = mm[key];
-          if (!m) continue;
-          for (const t of (m.tags || [])) {
-            const n = typeof t === 'string' ? t : (t && t.name);
-            if (n) owned.add(n);
-          }
-        }
-        for (const n of owned) counts[n] = (counts[n] || 0) + 1;
-      }
-    }
+    for (const n of inGroup) counts[n] = (counts[n] || 0) + 1;
   }
   return { names: cleanTagNames([...nameSet]), counts };
 }
@@ -937,7 +928,7 @@ async function writeTagBank(root, names, counts) {
   return clean;
 }
 // 标签库 = 账本里「当前仍然存在」的标签快照：删掉某级标签后若全库不再使用即从库里消失。
-// v0.4.1 起同时记录每个标签被多少文件拥有，供仪表盘标签墙按文件数决定字号。
+// 同时记录每个标签被多少个组拥有，供仪表盘标签墙按组数决定字号。
 async function syncTagBank(root) {
   const data = await ledgerTagData(root);
   return writeTagBank(root, data.names, data.counts);
@@ -1001,7 +992,7 @@ async function scanLibrary(root) {
       for (const g of (c.groups || [])) {
         if (g.cover) oldCover[relKey(old.root || root, g.path)] = g.cover;
       }
-    // 作者 / 标签 / 来源：新版读 meta，旧版自动迁移
+    // 维护信息（作者 / 标签）：只属于「组」，新版读 meta，旧版自动迁移
     const metaMap = metaFromLedger(old, root);
     const catNames = [];
     for (const n of await fs.readdir(root)) {
@@ -1013,7 +1004,6 @@ async function scanLibrary(root) {
     for (const cn of catNames.sort(tagCompare)) {
       const catPath = path.join(root, cn);
       const catRel = relKey(root, catPath);
-      const catOwn = metaMap[catRel] || emptyMeta();
       const groups = [];
       let gNames = [];
       try { gNames = await fs.readdir(catPath); } catch {}
@@ -1025,12 +1015,8 @@ async function scanLibrary(root) {
         if (!st.isDirectory()) continue;
         const collected = await collectFiles(gp);
         const { fileCount, totalSize } = collected;
-        // 每个对象都带上相对路径 rel，渲染层据此计算继承链；tags 是「本级自有标签」
-        const files = collected.files.map(f => {
-          const rel = relKey(root, f.path);
-          const own = metaMap[rel] || emptyMeta();
-          return { ...f, rel, tags: own.tags };
-        });
+        // 文件只带 rel 用于定位其所属组，不再携带任何维护信息
+        const files = collected.files.map(f => ({ ...f, rel: relKey(root, f.path) }));
         const parsed = parseGroupName(g);
         const rel = relKey(root, gp);
         const meta = metaMap[rel] || emptyMeta();
@@ -1057,14 +1043,12 @@ async function scanLibrary(root) {
         name: cn, path: catPath, rel: catRel,
         groupCount: groups.length,
         totalSize: groups.reduce((s, g) => s + g.totalSize, 0),
-        tags: catOwn.tags,
         groups
       });
     }
     const indexData = {
       name: libName || path.basename(root), updatedAt: Date.now(), root, rel: '',
-      metaVersion: 2, meta: metaMap,
-      tags: (metaMap[''] || emptyMeta()).tags,
+      metaVersion: 3, meta: metaMap,
       categories
     };
     // 账本随文库走（隐藏文件，不会被当作大类）
@@ -1113,7 +1097,7 @@ ipcMain.handle('lib:relocate', async (e, { oldPath, newPath }) => {
 });
 
 // 所有文库「当前仍在使用」的标签并集：供「添加已有标签」跨文库选取。
-// 真源是各文库账本里四个层级现存的标签；标签库文件只是随文库存放的副本，
+// 真源是各文库账本里现存的组级标签；标签库文件只是随文库存放的副本，
 // 每次读取时顺手刷新成当前值（早期累计词库里的历史词会自动清掉）。
 // 账本不可读时才回退到标签库快照，避免账本损坏时把候选标签误清空。
 ipcMain.handle('lib:tagBanks', async () => {
@@ -1144,11 +1128,39 @@ ipcMain.handle('lib:tagBanks', async () => {
   return { tags };
 });
 
-// 仪表盘标签墙：所有文库「当前存在」标签的并集，每个标签附跨库文件总数。
-// 真源是各文库账本（按继承链现算文件数），账本损坏才回退到随文库存放的标签库快照。
+// 所有文库「当前仍在使用」的作者并集：供「添加已有作者」跨文库多选。
+// 真源是各文库账本里现存的组级作者；只读聚合，与标签库同样在账本损坏时按空处理。
+ipcMain.handle('lib:authorBanks', async () => {
+  const map = new Map();                    // 作者名 -> 来源文库名集合
+  let libs = [];
+  try { libs = readRegistry().libraries || []; } catch {}
+  for (const lib of libs) {
+    const root = lib.path;
+    if (!root || !fss.existsSync(root) || !isAllowed(root)) continue;
+    let led;
+    try { led = await readLedger(path.join(root, '.library-index.json'), root); }
+    catch { continue; }
+    const label = lib.name || path.basename(root);
+    const mm = metaFromLedger(led, root);
+    for (const m of Object.values(mm))
+      for (const a of (m.author || [])) {
+        const name = String(a == null ? '' : a).trim();
+        if (!name) continue;
+        if (!map.has(name)) map.set(name, new Set());
+        map.get(name).add(label);
+      }
+  }
+  const authors = [...map.entries()]
+    .sort((a, b) => tagCompare(a[0], b[0]))
+    .map(([name, ls]) => ({ name, libs: [...ls].sort(tagCompare) }));
+  return { authors };
+});
+
+// 仪表盘标签墙：所有文库「当前存在」标签的并集，每个标签附跨库「组数」（拥有该标签的组数量）。
+// 真源是各文库账本（按组级 meta 现算组数），账本损坏才回退到随文库存放的标签库快照。
 // 顺手把各库标签库刷新为当前值；只读聚合，不改动任何标签本身。
 ipcMain.handle('lib:tagWall', async () => {
-  const map = new Map();                    // 标签名 -> { count, libs:Set }
+  const map = new Map();                    // 标签名 -> { groupCount, libs:Set }
   let libs = [];
   try { libs = readRegistry().libraries || []; } catch {}
   for (const lib of libs) {
@@ -1162,25 +1174,22 @@ ipcMain.handle('lib:tagWall', async () => {
     } catch { data = readTagBankFull(root); }
     const label = lib.name || path.basename(root);
     for (const n of cleanTagNames(data.names)) {
-      if (!map.has(n)) map.set(n, { count: 0, libs: new Set() });
+      if (!map.has(n)) map.set(n, { groupCount: 0, libs: new Set() });
       const e = map.get(n);
-      e.count += data.counts[n] || 0;
+      e.groupCount += data.counts[n] || 0;
       e.libs.add(label);
     }
   }
   const tags = [...map.entries()]
     .sort((a, b) => tagCompare(a[0], b[0]))
-    .map(([name, v]) => ({ name, fileCount: v.count, libs: [...v.libs].sort(tagCompare) }));
+    .map(([name, v]) => ({ name, groupCount: v.groupCount, libs: [...v.libs].sort(tagCompare) }));
   return { tags };
 });
 
-// 跨文库标签检索：仪表盘标签墙点击某标签后，返回全部文库中命中它的条目。
-// 命中口径与库内标签检索一致：沿 文库→大类→组→文件 的继承链，任一级带此标签即算命中。
-// 每条结果带来源文库名（libName），便于跨库同名对象区分。只读，不改动任何账本。
-ipcMain.handle('lib:searchTag', async (e, { tag } = {}) => {
-  const name = String(tag == null ? '' : tag).trim();
-  if (!name) return { tag: name, list: [] };
-  const out = [];
+// 仪表盘作者墙：所有文库「当前存在」作者的并集，每个作者附跨库「组数」（拥有该作者的组数量）。
+// 真源是各文库账本的组级 meta；只读聚合，不改动任何账本。
+ipcMain.handle('lib:authorWall', async () => {
+  const map = new Map();                    // 作者名 -> { groupCount, libs:Set }
   let libs = [];
   try { libs = readRegistry().libraries || []; } catch {}
   for (const lib of libs) {
@@ -1189,33 +1198,68 @@ ipcMain.handle('lib:searchTag', async (e, { tag } = {}) => {
     let led;
     try { led = await readLedger(path.join(root, '.library-index.json'), root); }
     catch { continue; }
-    const libName = lib.name || path.basename(root);
+    const label = lib.name || path.basename(root);
     const mm = metaFromLedger(led, root);
-    const hit = (p) => {
-      for (const key of chainKeys(relKey(root, p))) {
-        const m = mm[key];
-        if (!m) continue;
-        for (const t of (m.tags || [])) {
-          if ((typeof t === 'string' ? t : (t && t.name)) === name) return true;
-        }
+    for (const m of Object.values(mm)) {
+      const inGroup = new Set();            // 同一个组内同名作者去重
+      for (const a of (m.author || [])) {
+        const name = String(a == null ? '' : a).trim();
+        if (name) inGroup.add(name);
       }
-      return false;
-    };
-    if (hit(root)) out.push({ kind: 'lib', name: libName, path: root, libName, sub: '' });
-    for (const c of (led.categories || [])) {
-      if (hit(c.path)) out.push({ kind: 'cat', name: c.name || path.basename(c.path), path: c.path, libName, sub: '' });
-      for (const g of (c.groups || [])) {
-        if (hit(g.path)) out.push({ kind: 'group', name: g.displayName || g.name || path.basename(g.path), path: g.path, libName, sub: '' });
-        for (const f of (g.files || [])) {
-          if (hit(f.path)) out.push({ kind: 'file', name: f.name || path.basename(f.path), path: f.path, libName, category: f.category, size: f.size || 0, sub: '' });
-        }
+      for (const name of inGroup) {
+        if (!map.has(name)) map.set(name, { groupCount: 0, libs: new Set() });
+        const e = map.get(name);
+        e.groupCount += 1;
+        e.libs.add(label);
       }
     }
   }
-  const order = { lib: 0, cat: 1, group: 2, file: 3 };
-  out.sort((a, b) => (order[a.kind] - order[b.kind]) || tagCompare(a.libName, b.libName) || tagCompare(a.name, b.name));
-  return { tag: name, list: out };
+  const authors = [...map.entries()]
+    .sort((a, b) => tagCompare(a[0], b[0]))
+    .map(([name, v]) => ({ name, groupCount: v.groupCount, libs: [...v.libs].sort(tagCompare) }));
+  return { authors };
 });
+
+// 跨文库检索：标签 / 作者墙点击后，返回全部文库中「拥有该标签 / 作者的组」。
+// 维护信息只在组级，故结果只含组（kind=group），每条带来源文库名（libName）。
+// 只读，不改动任何账本。
+function crossLibGroupSearch(field) {
+  return async (e, payload) => {
+    const raw = (payload && (field === 'tag' ? payload.tag : payload.author));
+    const name = String(raw == null ? '' : raw).trim();
+    if (!name) return { [field]: name, list: [] };
+    const out = [];
+    let libs = [];
+    try { libs = readRegistry().libraries || []; } catch {}
+    for (const lib of libs) {
+      const root = lib.path;
+      if (!root || !fss.existsSync(root) || !isAllowed(root)) continue;
+      let led;
+      try { led = await readLedger(path.join(root, '.library-index.json'), root); }
+      catch { continue; }
+      const libName = lib.name || path.basename(root);
+      const mm = metaFromLedger(led, root);
+      for (const c of (led.categories || [])) {
+        for (const g of (c.groups || [])) {
+          const m = mm[relKey(root, g.path)];
+          if (!m) continue;
+          const list = field === 'tag' ? (m.tags || []) : (m.author || []);
+          const hit = list.some(v => field === 'tag'
+            ? ((typeof v === 'string' ? v : (v && v.name)) === name)
+            : (String(v == null ? '' : v).trim() === name));
+          if (hit) out.push({
+            kind: 'group', name: g.displayName || g.name || path.basename(g.path),
+            path: g.path, libName, sub: `${(g.files || []).length} 文件`
+          });
+        }
+      }
+    }
+    out.sort((a, b) => tagCompare(a.libName, b.libName) || tagCompare(a.name, b.name));
+    return { [field]: name, list: out };
+  };
+}
+ipcMain.handle('lib:searchTag', crossLibGroupSearch('tag'));
+ipcMain.handle('lib:searchAuthor', crossLibGroupSearch('author'));
 
 // 文库列表（注册表内容 + 是否仍存在于磁盘）
 ipcMain.handle('lib:list', async () => {
@@ -1239,14 +1283,13 @@ ipcMain.handle('lib:list', async () => {
     let exists = false, mtime = null;
     try { const st = await fs.stat(lib.path); exists = st.isDirectory(); mtime = st.mtimeMs; } catch {}
     // 概览所需的统计从各文库自带的账本读取（比逐个重新扫描快得多）
-    let catCount = 0, groupCount = 0, totalSize = 0, fileCount = 0, updatedAt = null, cover = null, libMeta = null;
+    let catCount = 0, groupCount = 0, totalSize = 0, fileCount = 0, updatedAt = null, cover = null;
     if (exists) {
       try {
         const d = await readLedger(path.join(lib.path, '.library-index.json'), lib.path);
         const cats = d.categories || [];
         catCount = cats.length;
         updatedAt = d.updatedAt || null;
-        if (d.meta && typeof d.meta === 'object') libMeta = d.meta[''] || null;
         for (const c of cats) {
           for (const g of (c.groups || [])) {
             groupCount++;
@@ -1258,7 +1301,7 @@ ipcMain.handle('lib:list', async () => {
       } catch { /* 账本缺失或损坏时按空文库展示 */ }
     }
     libs.push({ name: lib.name, path: lib.path, exists, mtime,
-      catCount, groupCount, fileCount, totalSize, updatedAt, cover, meta: libMeta });
+      catCount, groupCount, fileCount, totalSize, updatedAt, cover });
   }
   // 文库按名称排序，与注册表登记顺序无关
   libs.sort((a, b) => tagCompare(a.name, b.name));
@@ -1432,40 +1475,38 @@ async function updateGroupMeta(root, groupPath, patch) {
   } catch (err) { return { error: err.message }; }
 }
 
-// 写入某一层级的自有信息（整级替换）。文件层级只允许 tags。
+// 写入维护信息（整级替换）。v0.4.2 起维护信息只属于「组」，非组级一律拒绝。
 async function writeMeta(root, rel, patch, level) {
+  if (levelOfRel(rel) !== 'group') return { error: '维护信息只能在「组」层级编辑' };
   const lp = path.join(root, '.library-index.json');
   let led = {};
   try { led = await readLedger(lp, root); } catch {}
   const mm = metaFromLedger(led, root);
   const cur = mm[rel] || emptyMeta();
   const next = emptyMeta();
-  if ((level || levelOfRel(rel)) !== 'file') {
-    next.author = patch.author !== undefined ? metaList(patch.author) : cur.author;
-    next.source = patch.source !== undefined ? metaList(patch.source) : cur.source;
-  }
+  next.author = patch.author !== undefined ? metaList(patch.author) : cur.author;
   next.tags = patch.tags !== undefined ? mergeTags([], patch.tags) : cur.tags;
-  if (next.author.length || next.source.length || next.tags.length) mm[rel] = next;
+  if (next.author.length || next.tags.length) mm[rel] = next;
   else delete mm[rel];
   await writeLedger(lp, persistMeta(led, mm), root);
   await bestEffortSyncTagBank(root);
   return { ok: true, meta: next };
 }
-// 批量添加用：保留该组已有的作者 / 来源 / 标签，把新一批的值合并进去（去重）
-async function mergeMeta(root, rel, patch, level) {
+// 批量添加用：合并进所属组的作者 / 标签（去重）
+async function mergeMeta(root, rel, patch) {
+  const gr = levelOfRel(rel) === 'file' ? String(rel).split('/').slice(0, 2).join('/') : rel;
+  if (levelOfRel(gr) !== 'group') return emptyMeta();
   const lp = path.join(root, '.library-index.json');
   let led = {};
   try { led = await readLedger(lp, root); } catch {}
   const mm = metaFromLedger(led, root);
-  const cur = mm[rel] || emptyMeta();
+  const cur = mm[gr] || emptyMeta();
   const next = {
     author: [...new Set([...cur.author, ...metaList(patch.author)])],
-    source: [...new Set([...cur.source, ...metaList(patch.source)])],
     tags: mergeTags(cur.tags, patch.tags)
   };
-  if ((level || levelOfRel(rel)) === 'file') { next.author = []; next.source = []; }
-  if (next.author.length || next.source.length || next.tags.length) mm[rel] = next;
-  else delete mm[rel];
+  if (next.author.length || next.tags.length) mm[gr] = next;
+  else delete mm[gr];
   await writeLedger(lp, persistMeta(led, mm), root);
   await bestEffortSyncTagBank(root);
   return next;
@@ -1488,9 +1529,8 @@ ipcMain.handle('lib:setCover', async (e, { root, groupPath, cover }) => {
   return updateGroupMeta(root, groupPath, { cover: cover || null });
 });
 
-// ---------- 批量添加：一次导入一批文件，并把作者 / 标签 / 来源记到目标组 ----------
-// 文件层级不记录作者与来源，统一由组向下继承；账本用相对路径做键，
-// 文库整体迁移 / 换电脑重新定位后仍能对上号。
+// ---------- 批量添加：一次导入一批文件，并把作者 / 标签记到目标组 ----------
+// 维护信息只属于组；账本用相对路径做键，文库整体迁移 / 换电脑重新定位后仍能对上号。
 const BATCH_MAX_FILES = 5000;
 
 // 找出某个路径属于哪个已登记文库（有多个时取最长匹配）
@@ -1632,7 +1672,7 @@ async function expandBatchSources(sources, root) {
 }
 
 ipcMain.handle('lib:batchAdd', async (e, payload) => {
-  const { root, target, sources, author, tags, source } = payload || {};
+  const { root, target, sources, author, tags } = payload || {};
   if (!root || !isAllowed(root)) return { error: '无权访问该文库' };
   let rootStat;
   try { rootStat = await fs.stat(root); } catch { return { error: '文库目录不存在' }; }
@@ -1684,8 +1724,7 @@ ipcMain.handle('lib:batchAdd', async (e, payload) => {
   const reserved = new Set();
   try { for (const n of await fs.readdir(groupPath)) reserved.add(norm(n)); } catch {}
   const cleanTags = mergeTags([], (tags || []).map(t => String(t).trim()));
-  const cleanAuthor = String(author || '').trim();
-  const cleanSource = String(source || '').trim();
+  const cleanAuthor = metaList(author);
   let done = 0;
   const failed = [...expanded.failed];
   for (const src of expanded.files) {
@@ -1706,14 +1745,13 @@ ipcMain.handle('lib:batchAdd', async (e, payload) => {
     }
   }
 
-  // 4. 作者 / 标签 / 来源统一记到「组」上；文件层级不记录作者与来源，靠继承显示。
+  // 4. 作者 / 标签统一记到「组」上（v0.4.2 维护信息仅组级）。
   //     已有信息保留，新一批的值合并进去（去重），重复往同一组添加不会互相覆盖。
   try {
     await mergeMeta(root, relKey(root, groupPath), {
-      author: cleanAuthor ? [cleanAuthor] : [],
-      tags: cleanTags,
-      source: cleanSource ? [cleanSource] : []
-    }, 'group');
+      author: cleanAuthor,
+      tags: cleanTags
+    });
   } catch (err) { console.log('[批次] 组信息写入失败：' + err.message); }
 
   return { ok: true, root, groupPath, done, failed, skipped: expanded.skipped };

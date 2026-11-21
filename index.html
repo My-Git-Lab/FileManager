@@ -51,32 +51,11 @@
           </div>
         </section>
 
-        <!-- 检索（搜索） -->
-        <section class="lp-sec" data-section="search">
-          <div class="lp-sec-title">
-            <span>检索当前文库</span>
-            <button id="btn-search-mode" title="点击切换检索方式">按标签</button>
-          </div>
-          <div class="search-row">
-            <input id="search-input" type="text" placeholder="搜索文件名…" spellcheck="false">
-            <button id="btn-search" title="搜索">搜索</button>
-          </div>
-          <div id="cat-chips"></div>
-          <div id="lib-tag-chips" class="tag-chips hidden"></div>
-          <div id="tag-levels" class="tag-levels hidden">
-            <span class="tl-title">搜索层级（可多选）</span>
-            <label><input type="checkbox" data-level="lib">文库</label>
-            <label><input type="checkbox" data-level="cat">大类</label>
-            <label><input type="checkbox" data-level="group">组</label>
-            <label><input type="checkbox" data-level="file">文件</label>
-          </div>
-        </section>
-
         <!-- 快捷操作（文库操作） -->
         <section class="lp-sec" data-section="workbench">
           <div class="lp-sec-title">快捷操作</div>
           <div class="lp-btn-row">
-            <button id="btn-batch-add" class="batch-btn" title="按批次导入文件或整个文件夹，并统一填写作者 / 标签 / 来源">批量添加</button>
+            <button id="btn-batch-add" class="batch-btn" title="按批次导入文件或整个文件夹，并统一填写作者 / 标签">批量添加</button>
           </div>
           <div class="lp-btn-row">
             <button id="btn-new-group" class="primary-btn">新建组</button>
@@ -155,9 +134,26 @@
       <div id="dashboard-body" class="stage-body"></div>
     </div>
 
-    <!-- 搜索：全宽显示搜索功能与结果（初版） -->
+    <!-- 搜索：全宽舞台，上方搜索控件、下方结果 -->
     <div id="stage-search" class="stage hidden">
-      <div id="search-stage-body" class="stage-body"></div>
+      <div class="stage-body">
+        <!-- 搜索控件（上）：检索方式切换 + 关键词 + 分类 / 标签 / 作者 chips -->
+        <section id="search-controls" class="search-controls">
+          <div class="sc-head">
+            <span class="sc-title">检索当前文库</span>
+            <button id="btn-search-mode" title="点击切换检索方式">按标签</button>
+          </div>
+          <div class="search-row">
+            <input id="search-input" type="text" placeholder="搜索文件名…" spellcheck="false">
+            <button id="btn-search" title="搜索">搜索</button>
+          </div>
+          <div id="cat-chips"></div>
+          <div id="lib-tag-chips" class="tag-chips hidden"></div>
+          <div id="lib-author-chips" class="tag-chips hidden"></div>
+        </section>
+        <!-- 结果区（下）：由 renderSearchStage 填充 -->
+        <div id="search-stage-body"></div>
+      </div>
     </div>
 
     <!-- 记录：全宽显示历史记录（初版） -->
