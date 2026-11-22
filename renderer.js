@@ -443,6 +443,7 @@ $('#modal-mask').addEventListener('mousedown', (e) => {
   hideModal();
   // 内置选择器被点空白关闭时，恢复批量添加表单
   if (batchState && !batchState.busy) setTimeout(() => { if (batchState && $('#modal-mask').classList.contains('hidden')) renderBatchForm(); }, 0);
+  if (batchGroupState && !batchGroupState.busy) setTimeout(() => { if (batchGroupState && $('#modal-mask').classList.contains('hidden')) renderBatchGroupForm(); }, 0);
 });
 
 // ---------- 内置选择器（系统文件对话框不可用/被取消时的回退） ----------
@@ -531,6 +532,51 @@ async function pickFilesSafe() {
     if (files && files.length) return files;
   } catch {}
   return inlinePickFiles();
+}
+// 多选文件夹（「批量添加（组）」用）：系统对话框可一次挑多个，失败则回退内置多选
+async function pickFoldersSafe() {
+  try {
+    if (typeof window.api.pickFolders !== 'function') throw new Error('no pickFolders');
+    const dirs = await window.api.pickFolders();
+    if (dirs && dirs.length) return dirs;
+  } catch {}
+  return inlinePickFolders();
+}
+// 内置多选文件夹选择器：点文件夹名进入，点左侧「＋选为组」把当前目录加入
+function inlinePickFolders() {
+  return new Promise((resolve) => {
+    let cur = state.homeDirs.home || '/';
+    const picked = new Set();
+    showModal('选择文件夹（可多选）', `
+      <div class="ip-path-row">
+        <button id="ip-up" type="button">上一级</button>
+        <span id="ip-cur" class="ip-cur"></span>
+      </div>
+      <div id="ip-list" class="ip-list"></div>
+      <div id="ip-count" class="hint"></div>
+      <div class="ba-tools" style="margin-top:8px"><button id="ip-add" type="button">＋ 选为组（当前文件夹）</button></div>`,
+      () => { resolve([...picked]); }, '确定',
+      () => resolve(null));
+    const paintCount = () => {
+      const el = $('#ip-count');
+      if (el) el.textContent = `已选 ${picked.size} 个文件夹（点文件夹名进入子目录，点上方按钮把当前文件夹加入）`;
+    };
+    const render = async () => {
+      $('#ip-cur').textContent = cur;
+      paintCount();
+      const list = $('#ip-list');
+      const res = await window.api.list(cur);
+      if (res.error) { list.innerHTML = `<div class="hint">${escapeHtml(res.error)}</div>`; return; }
+      const dirs = res.entries.filter(x => x.isDir);
+      list.innerHTML = dirs.length
+        ? dirs.map(d => `<div class="ip-item" data-p="${escapeHtml(d.path)}">📁 ${escapeHtml(d.name)}</div>`).join('')
+        : '<div class="hint" style="padding:8px">没有子文件夹，可直接点上方按钮选当前文件夹</div>';
+      list.querySelectorAll('.ip-item').forEach(item => { item.onclick = () => { cur = item.dataset.p; render(); }; });
+    };
+    $('#ip-up').onclick = () => { if (cur !== '/') { cur = parentOf(cur); render(); } };
+    $('#ip-add').onclick = () => { picked.add(cur); paintCount(); };
+    render();
+  });
 }
 
 // ---------- 打开文件（系统默认程序） ----------
@@ -3123,6 +3169,253 @@ async function openBatchAdd() {
   renderBatchForm();
 }
 $('#btn-batch-add').onclick = openBatchAdd;
+
+// ---------- 批量添加（组）：每个文件/文件夹各建一个组，全部归入同一个大类 ----------
+// 与「批量添加（文件）」共用标签库 / 作者库 / 位置列表等控件，只是位置只到「大类」级、
+// 组名由来源自动决定，作者 / 标签写在本批新建的每一个组上。
+let batchGroupState = null;   // 独立于 batchState，避免两个弹窗状态互相污染
+
+function batchGroupLocHTML(b) {
+  const rows = [];
+  for (const lib of b.locations) {
+    rows.push(batchLocRow(b,
+      { level: 'lib', path: lib.path, libPath: lib.path, catName: '', label: lib.name },
+      `📚 ${escapeHtml(lib.name)}`, '整个文库', 'ba-loc-lib'));
+    for (const c of lib.categories) {
+      const catLabel = `${lib.name} / ${c.name}`;
+      rows.push(batchLocRow(b,
+        { level: 'category', path: c.path, libPath: lib.path, catName: c.name, label: catLabel },
+        `📁 ${escapeHtml(c.name)}`, '大类', 'ba-loc-cat'));
+    }
+  }
+  return rows.length ? rows.join('')
+    : '<div class="hint" style="padding:8px">还没有可用文库，请先在左侧「新建」一个</div>';
+}
+
+function renderBatchGroupForm() {
+  const b = batchGroupState;
+  if (!b) return;
+  const srcHTML = b.sources.length
+    ? b.sources.map((s, i) => `<div class="ba-item"><span>${s.kind === 'dir' ? '📁' : '📄'}</span><span class="ba-name" title="${escapeHtml(s.path)}">${escapeHtml(baseName(s.path))}</span><span class="ba-path" title="${escapeHtml(s.path)}">${escapeHtml(s.path)}</span><span class="ba-x" data-bg-src="${i}" title="移除">✕</span></div>`).join('')
+    : '<div class="hint" style="padding:6px">尚未选择。可反复点击「选择文件」「选择文件夹」累加。</div>';
+  const filesCount = b.sources.filter(s => s.kind === 'file').length;
+  const dirsCount = b.sources.filter(s => s.kind === 'dir').length;
+  const mixed = filesCount > 0 && dirsCount > 0;
+  const libLevel = b.loc && b.loc.level === 'lib';
+  const html = `
+    <div class="ba-sec">
+      <div class="ba-sec-head"><span class="ba-num">1</span>待添加的来源（每个文件 / 文件夹各建一个组）</div>
+      <div class="ba-tools">
+        <button id="bg-pick-files" type="button">选择文件（可多选）</button>
+        <button id="bg-pick-dirs" type="button">选择文件夹（可多选）</button>
+        <button id="bg-clear" type="button">清空</button>
+      </div>
+      <div class="ba-list">${srcHTML}</div>
+      <div class="hint">共 ${b.sources.length} 项${b.sources.length ? `（${filesCount} 个文件 · ${dirsCount} 个文件夹）` : ''}。
+        选择<b>文件</b>：每个文件建一个同名组，文件移动进去；选择<b>文件夹</b>：每个文件夹建一个同名组，里面的文件平铺移动进去（<b>文件夹内不能再含子文件夹</b>，否则整批失败并提示）。
+        <b>文件和文件夹不能混选</b>。本操作为「移动」：成功后原位置不再保留。</div>
+      ${mixed ? '<div class="hint" style="color:var(--danger)">⚠ 文件和文件夹不能混在一起添加，请移除其中一类再继续。</div>' : ''}
+    </div>
+
+    <div class="ba-sec">
+      <div class="ba-sec-head"><span class="ba-num">2</span>新建的组统一归入哪个大类</div>
+      <div class="ba-loc-list">${batchGroupLocHTML(b)}</div>
+      <div class="ba-summary">当前位置：<b>${b.loc ? escapeHtml(b.loc.label) : '尚未选择'}</b></div>
+      ${libLevel ? `
+        <label class="field-label">归入大类</label>
+        <select id="bg-cat">${batchCatOptions(b)}</select>
+        ${b.catChoice === '__new__' ? `<input id="bg-new-cat" placeholder="输入新大类名称" value="${escapeHtml(b.newCatName)}" spellcheck="false">` : ''}
+        <div class="hint">选「整个文库」时需指定一个大类；本批所有新组都放进这一个大类。选「大类」则直接归入该大类。</div>
+      ` : '<div class="hint">本批所有新组都会放进上面选中的大类。</div>'}
+    </div>
+
+    <div class="ba-sec">
+      <div class="ba-sec-head"><span class="ba-num">3</span>本批组的作者（保存到每个新组，可多选）</div>
+      <input id="bg-author" placeholder="多个用「、」分隔，留空则不填写" value="${escapeHtml(b.author)}" spellcheck="false">
+      ${authorBankSectionHTML(b.authorQuery || '', '候选是各文库当前仍在使用的作者；点一下加入、再点一下移除，选中的会写进本批每一个组。')}
+      <div class="hint">本批创建的每个组都会保存这些作者。</div>
+    </div>
+
+    <div class="ba-sec">
+      <div class="ba-sec-head"><span class="ba-num">4</span>本批组的标签（保存到每个新组，可添加多个）</div>
+      <div class="ba-row">
+        <input id="bg-tag-input" placeholder="输入标签后回车，或点「添加」" spellcheck="false">
+        <button id="bg-tag-add" type="button">添加</button>
+      </div>
+      <div class="ba-chips">${b.tags.length ? batchTagChipsHtml(b.tags) : '<span class="hint">尚未添加标签</span>'}</div>
+      ${tagBankSectionHTML(b.tbQuery || '', '候选是各文库当前仍在使用的标签；点一下加入、再点一下移除，选中的会写进本批每一个组。')}
+      <div class="hint">本批创建的每个组都会保存这些标签；在「搜索」中按标签即可筛到这些组。</div>
+    </div>`;
+  showModal('批量添加（组）', html, submitBatchGroups, '开始添加', () => { batchGroupState = null; },
+    { wide: true, enterOK: false, noFocus: true });
+  bindBatchGroupEvents();
+}
+
+function bindBatchGroupEvents() {
+  const b = batchGroupState;
+  const body = $('#modal-body');
+  const on = (sel, fn) => { const el = $(sel); if (el) el.onclick = fn; };
+  on('#bg-pick-files', async () => {
+    const picked = await pickFilesSafe();
+    if (picked && picked.length) for (const p of picked) if (!b.sources.some(s => s.path === p)) b.sources.push({ path: p, kind: 'file' });
+    if (batchGroupState) renderBatchGroupForm();
+  });
+  on('#bg-pick-dirs', async () => {
+    const picked = await pickFoldersSafe();
+    if (picked && picked.length) for (const p of picked) if (!b.sources.some(s => s.path === p)) b.sources.push({ path: p, kind: 'dir' });
+    if (batchGroupState) renderBatchGroupForm();
+  });
+  on('#bg-clear', () => { b.sources = []; renderBatchGroupForm(); });
+  body.querySelectorAll('[data-bg-src]').forEach(el => el.onclick = () => {
+    b.sources.splice(parseInt(el.dataset.bgSrc), 1);
+    renderBatchGroupForm();
+  });
+  body.querySelectorAll('.ba-loc').forEach(el => el.onclick = () => {
+    b.loc = {
+      level: el.dataset.level, path: el.dataset.path, libPath: el.dataset.lib,
+      catName: el.dataset.cat || '', label: el.dataset.label
+    };
+    if (b.loc.level === 'lib') {
+      const lib = b.locations.find(l => l.path === b.loc.libPath);
+      b.catChoice = lib && lib.categories.length ? lib.categories[0].name : '__new__';
+    }
+    renderBatchGroupForm();
+  });
+  const bindVal = (sel, key) => {
+    const el = $(sel);
+    if (el) el.addEventListener('input', () => { b[key] = el.value; });
+  };
+  let authorBankRepaint = () => {};
+  bindVal('#bg-author', 'author');
+  bindVal('#bg-new-cat', 'newCatName');
+  const authorInp = $('#bg-author');
+  if (authorInp) authorInp.addEventListener('input', () => authorBankRepaint());
+  const catSel = $('#bg-cat');
+  if (catSel) catSel.onchange = () => { b.catChoice = catSel.value; renderBatchGroupForm(); };
+  const addTag = () => {
+    const inp = $('#bg-tag-input');
+    if (!inp) return;
+    const v = inp.value.trim();
+    if (!v) return;
+    if (!b.tags.includes(v)) { b.tags.push(v); b.tags = sortTagNames(b.tags); }
+    b.focusTag = true;
+    renderBatchGroupForm();
+  };
+  on('#bg-tag-add', addTag);
+  const tagInp = $('#bg-tag-input');
+  if (tagInp) bindEnter(tagInp, addTag);
+  body.querySelectorAll('[data-ba-x]').forEach(el => el.onclick = () => {
+    b.tags = b.tags.filter(t => t !== el.dataset.baX);
+    renderBatchGroupForm();
+  });
+  authorBankRepaint = bindAuthorBankSection({
+    scope: body,
+    getNames: () => splitMetaList($('#bg-author') ? $('#bg-author').value : b.author),
+    setNames: (ns) => { b.author = sortTagNames(ns).join('、'); renderBatchGroupForm(); },
+    onQuery: (q) => { b.authorQuery = q; },
+    getPage: () => b.authorPage, setPage: (v) => { b.authorPage = v; },
+    onAfter: () => {}
+  });
+  bindTagBankSection({
+    scope: body,
+    getNames: () => b.tags,
+    setNames: (ns) => { b.tags = sortTagNames(ns); renderBatchGroupForm(); },
+    onQuery: (q) => { b.tbQuery = q; },
+    getPage: () => b.tbPage, setPage: (v) => { b.tbPage = v; },
+    onAfter: () => {}
+  });
+  if (b.focusTag) {
+    b.focusTag = false;
+    const inp = $('#bg-tag-input');
+    if (inp) setTimeout(() => inp.focus(), 20);
+  }
+}
+
+async function submitBatchGroups() {
+  const b = batchGroupState;
+  if (!b || b.busy) return true;
+  const grab = (sel, key) => { const el = $(sel); if (el) b[key] = el.value; };
+  grab('#bg-author', 'author'); grab('#bg-new-cat', 'newCatName');
+  if (!b.sources.length) { toast('请先选择要添加的文件或文件夹', true); return true; }
+  const filesCount = b.sources.filter(s => s.kind === 'file').length;
+  const dirsCount = b.sources.filter(s => s.kind === 'dir').length;
+  if (filesCount && dirsCount) { toast('文件和文件夹不能混在一起添加，请移除其中一类', true); return true; }
+  if (!b.loc) { toast('请选择新建组归入的大类位置', true); return true; }
+  const target = {
+    level: b.loc.level,
+    path: b.loc.path,
+    categoryName: b.loc.catName || ''
+  };
+  if (b.loc.level === 'lib') {
+    if (b.catChoice === '__new__') {
+      const n = (b.newCatName || '').trim();
+      if (!n) { toast('请填写新建大类的名称', true); return true; }
+      target.newCategoryName = n;
+      target.categoryName = n;
+    } else if (b.catChoice) target.categoryName = b.catChoice;
+  }
+  b.busy = true;
+  const okBtn = $('#modal-ok');
+  okBtn.disabled = true;
+  okBtn.textContent = '正在创建…';
+  let r;
+  try {
+    r = await window.api.libBatchAddGroups({
+      root: b.loc.libPath, target, sources: b.sources.map(s => s.path),
+      author: b.author, tags: b.tags
+    });
+  } catch (err) {
+    b.busy = false; okBtn.disabled = false; okBtn.textContent = '开始添加';
+    toast('批量添加（组）失败：' + err.message, true);
+    return true;
+  }
+  b.busy = false;
+  okBtn.disabled = false;
+  okBtn.textContent = '开始添加';
+  if (r.error) { toast(r.error, true); return true; }
+  const failPart = r.failed.length ? `，${r.failed.length} 个失败（${r.failed[0].reason}）` : '';
+  toast(`已创建 ${r.done} 个组${failPart}${r.skipped ? `，跳过 ${r.skipped} 个（已在文库内）` : ''}`);
+  if (r.added && r.added.length) addRecentAdded(r.added, r.root);
+  const root = r.root, categoryName = r.categoryName;
+  batchGroupState = null;
+  if (root !== state.libRoot) await selectLibrary(root);
+  else await loadLibrary(true);
+  // 定位到本次归入的大类
+  const cat = (state.libData && state.libData.categories || []).find(c => c.name === categoryName);
+  if (cat) {
+    state.libSel = { type: 'category', data: cat };
+    state.libPreviewFile = null;
+    state.view = 'cat';
+    state.libExpanded.add(cat.name);
+    clearLibFilters();
+    renderCurrentView();
+    renderLibTree();
+    renderBreadcrumb();
+  } else {
+    renderLibTree();
+    renderCurrentView();
+  }
+  return;
+}
+
+async function openBatchAddGroups() {
+  const fresh = {
+    sources: [], locations: [], loc: null,
+    catChoice: '', newCatName: '',
+    author: '', tags: [], busy: false, focusTag: false, tbQuery: '', authorQuery: '',
+    tbPage: 1, authorPage: 1
+  };
+  try { fresh.locations = await window.api.libLocations(); } catch { fresh.locations = []; }
+  if (!fresh.locations.length) { toast('请先创建或选择一个可用的文库', true); return; }
+  const cur = fresh.locations.find(l => l.path === state.libRoot) || fresh.locations[0];
+  fresh.loc = { level: 'lib', path: cur.path, libPath: cur.path, catName: '', label: cur.name };
+  fresh.catChoice = cur.categories.length ? cur.categories[0].name : '__new__';
+  try { await Promise.all([refreshTagBanks(), refreshAuthorBanks()]); }
+  catch { tagBankData = []; authorBankData = []; }
+  batchGroupState = fresh;
+  renderBatchGroupForm();
+}
+$('#btn-batch-add-groups').onclick = openBatchAddGroups;
 
 // ---------- 阅览区全屏 ----------
 const previewPanel = $('#preview-panel');

@@ -574,6 +574,17 @@ ipcMain.handle('dialog:pickFiles', async (e) => {
   } catch { return []; }
 });
 
+// 多选文件夹（「批量添加（组）」用）：一次可挑多个文件夹，每个作为一组
+ipcMain.handle('dialog:pickFolders', async (e) => {
+  try {
+    const r = await dialog.showOpenDialog(BrowserWindow.fromWebContents(e.sender), {
+      title: '选择文件夹（可多选，每个文件夹作为一个组）',
+      properties: ['openDirectory', 'multiSelections']
+    });
+    return r.canceled ? [] : r.filePaths;
+  } catch { return []; }
+});
+
 // ---------- IPC: 应用版本 ----------
 ipcMain.handle('app:version', () => app.getVersion());
 
@@ -1815,6 +1826,129 @@ ipcMain.handle('lib:batchAdd', async (e, payload) => {
   } catch (err) { console.log('[批次] 组信息写入失败：' + err.message); }
 
   return { ok: true, root, groupPath, done, added, failed, skipped: expanded.skipped };
+});
+
+// ---------- 批量添加（组）：每个文件/文件夹各建一个组，全部归入同一个大类 ----------
+// 与「批量添加（文件）」共用 createGroupFolder / moveInto / mergeMeta，但语义不同：
+//   · 多选文件   → 每个文件建一个同名组，把该文件移动进去
+//   · 多选文件夹 → 每个文件夹建一个同名组，把该文件夹里的「直属文件」移动进去
+//   · 文件夹内若还含子文件夹 → 视为失败并提示（组只放一层文件）；文件与文件夹混选 → 失败并提示
+//   · 所有新组都放进同一个目标大类；作者 / 标签写入每一个新组
+ipcMain.handle('lib:batchAddGroups', async (e, payload) => {
+  const { root, target, sources, author, tags } = payload || {};
+  if (!root || !isAllowed(root)) return { error: '无权访问该文库' };
+  let rootStat;
+  try { rootStat = await fs.stat(root); } catch { return { error: '文库目录不存在' }; }
+  if (!rootStat.isDirectory()) return { error: '文库路径不是文件夹' };
+  const rootAbs = path.resolve(root);
+  const inside = (p) => {
+    const a = path.resolve(p);
+    return a === rootAbs || a.startsWith(rootAbs + path.sep);
+  };
+
+  // 1. 解析唯一目标大类（所有组都进这里）
+  let categoryName;
+  if (target && target.level === 'category') {
+    if (!inside(target.path)) return { error: '所选大类不在该文库内' };
+    categoryName = path.basename(target.path);
+  } else {
+    categoryName = String((target && (target.newCategoryName || target.categoryName)) || '').trim();
+  }
+  const catBad = nameError(categoryName);
+  if (catBad) return { error: '大类名称无效：' + catBad };
+  if (categoryName.startsWith('.')) return { error: '大类名称不能以点开头（会被视为隐藏项）' };
+
+  // 2. 分类来源：先全部 stat，判断是「纯文件」「纯文件夹」还是混选
+  const items = [];
+  let hasFile = false, hasDir = false;
+  for (const src of (sources || [])) {
+    if (!isAllowed(src)) return { error: '无权访问所选路径：' + path.basename(src) };
+    let st;
+    try { st = await fs.stat(src); } catch (err) { return { error: '无法读取「' + path.basename(src) + '」：' + err.message }; }
+    if (st.isDirectory()) { hasDir = true; items.push({ src, kind: 'dir' }); }
+    else if (st.isFile()) { hasFile = true; items.push({ src, kind: 'file' }); }
+    else return { error: '不支持添加的类型：' + path.basename(src) };
+  }
+  if (!items.length) return { error: '请先选择要添加的文件或文件夹' };
+  if (hasFile && hasDir) return { error: '文件和文件夹不能混在一起添加：请只选文件，或只选文件夹' };
+  const kind = hasDir ? 'dir' : 'file';
+
+  // 3. 文件夹模式：若某个文件夹内还含子文件夹，整批判失败并提示
+  if (kind === 'dir') {
+    for (const it of items) {
+      let names;
+      try { names = await fs.readdir(it.src, { withFileTypes: true }); }
+      catch (err) { return { error: '无法读取文件夹「' + path.basename(it.src) + '」：' + err.message }; }
+      const sub = names.find(n => n.isDirectory());
+      if (sub) return { error: `文件夹「${path.basename(it.src)}」内还含有子文件夹「${sub.name}」，不能作为一个组添加；请先把子文件夹移走再试` };
+    }
+  }
+
+  // 4. 逐个建组并移动内容
+  const norm = (s) => process.platform === 'win32' ? s.toLowerCase() : s;
+  const cleanTags = mergeTags([], (tags || []).map(t => String(t).trim()));
+  const cleanAuthor = metaList(author);
+  const groups = [];          // 成功创建的组路径
+  const added = [];           // 真正落地的文件路径，供「最近添加」记录
+  const failed = [];
+  let skipped = 0;
+
+  for (const it of items) {
+    // 源在目标文库内部 → 跳过，避免把已归档内容再搬一次
+    if (inside(it.src)) { skipped++; continue; }
+    // 组名与来源同名：文件用完整文件名（含扩展名），文件夹用文件夹名
+    const display = path.basename(it.src);
+    const created = await createGroupFolder(root, categoryName, display);
+    if (created.error) { failed.push({ src: it.src, reason: created.error }); continue; }
+    const groupPath = created.path;
+
+    try {
+      if (it.kind === 'file') {
+        // 单文件 → 移动进新建的组，同名自动加序号
+        const base = path.basename(it.src);
+        const ext = path.extname(base), stem = path.basename(base, ext);
+        const reserved = new Set((await fs.readdir(groupPath)).map(norm));
+        let name = base, i = 1;
+        while (reserved.has(norm(name))) name = `${stem}_${i++}${ext}`;
+        const dest = path.join(groupPath, name);
+        await moveInto(it.src, dest);
+        added.push(dest);
+      } else {
+        // 文件夹 → 把里面的直属文件平铺移动进新建的组（隐藏文件跳过）
+        const names = await fs.readdir(it.src);
+        const reserved = new Set();
+        for (const n of names) {
+          if (n.startsWith('.')) continue;
+          let st;
+          try { st = await fs.stat(path.join(it.src, n)); } catch { continue; }
+          if (!st.isFile()) continue;   // 子文件夹已在第 3 步拦截，这里只认文件
+          const ext = path.extname(n), stem = path.basename(n, ext);
+          let name = n, j = 1;
+          while (reserved.has(norm(name))) name = `${stem}_${j++}${ext}`;
+          const dest = path.join(groupPath, name);
+          await moveInto(path.join(it.src, n), dest);
+          reserved.add(norm(name));
+          added.push(dest);
+        }
+      }
+    } catch (err) {
+      failed.push({ src: it.src, reason: err.message });
+      // 移动阶段失败：若组还是空的则删掉它，避免留下空组
+      try {
+        const left = await fs.readdir(groupPath);
+        if (!left.length) await fs.rmdir(groupPath);
+      } catch {}
+      continue;
+    }
+
+    // 作者 / 标签写在这个新组上（v0.4.2 起维护信息仅组级）
+    try {
+      await mergeMeta(root, relKey(root, groupPath), { author: cleanAuthor, tags: cleanTags });
+    } catch (err) { console.log('[批次建组] 组信息写入失败：' + err.message); }
+    groups.push(groupPath);
+  }
+
+  return { ok: true, root, categoryName, groups, done: groups.length, added, failed, skipped };
 });
 
 // Windows 的 NTFS 不区分大小写：仅改大小写时 existsSync(新名) 也会返回 true，

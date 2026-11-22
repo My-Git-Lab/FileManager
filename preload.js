@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('api', {
   showInFolder: (p) => ipcRenderer.invoke('fs:showInFolder', p),
   homeDirs: () => ipcRenderer.invoke('sys:homeDirs'),
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
+  pickFolders: () => ipcRenderer.invoke('dialog:pickFolders'),
   pickFiles: () => ipcRenderer.invoke('dialog:pickFiles'),
   readText: (p) => ipcRenderer.invoke('fs:readText', p),
   detail: (p) => ipcRenderer.invoke('fs:detail', p),
@@ -37,5 +38,6 @@ contextBridge.exposeInMainWorld('api', {
   libSetCover: (root, groupPath, cover) =>
     ipcRenderer.invoke('lib:setCover', { root, groupPath, cover }),
   libLocations: () => ipcRenderer.invoke('lib:locations'),
-  libBatchAdd: (payload) => ipcRenderer.invoke('lib:batchAdd', payload)
+  libBatchAdd: (payload) => ipcRenderer.invoke('lib:batchAdd', payload),
+  libBatchAddGroups: (payload) => ipcRenderer.invoke('lib:batchAddGroups', payload)
 });
