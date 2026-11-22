@@ -868,6 +868,10 @@ button { font-family: inherit; }
 }
 .pager button:hover:not(:disabled) { background: var(--hover); }
 .pager button:disabled { opacity: .4; cursor: default; }
+/* 紧凑分页条：标签 / 作者候选列表（每页 25 个）与搜索条件候选 */
+.pager.chip-pager { gap: 8px; padding: 6px 0 2px; font-size: var(--fs-sm); }
+.pager.chip-pager button { padding: 2px 9px; font-size: var(--fs-xs); }
+#tb-pager:empty, #ab-pager:empty, #cond-tag-pager:empty, #cond-author-pager:empty { display: none; }
 
 /* ========== 内置文件/文件夹选择器 ========== */
 .ip-path-row {
@@ -1338,6 +1342,23 @@ body[data-section="dashboard"] #split-left { display: none; }
 /* 搜索为全宽舞台（上下布局）：隐藏左侧工作区与分隔条，搜索控件在上、结果在下 */
 body[data-section="search"] #left-panel,
 body[data-section="search"] #split-left { display: none; }
+
+/* 记录为全宽舞台（上下布局）：上方最近添加、下方打开历史 */
+body[data-section="records"] #left-panel,
+body[data-section="records"] #split-left { display: none; }
+.rec-panel .rec-title {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-bottom: 8px;
+}
+.rec-panel .rec-count { color: var(--text-weak); font-size: var(--fs-xs); font-weight: 400; margin-left: 4px; }
+.rec-panel .rec-acts { display: inline-flex; gap: 6px; }
+.rec-panel .rec-body { padding-top: 2px; }
+.rec-panel .rec-body.hidden { display: none; }
+.stage-act {
+  padding: 2px 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel-2); color: var(--text-sub); cursor: pointer; font-size: var(--fs-xs);
+}
+.stage-act:hover { background: var(--hover); color: var(--accent); }
 .search-controls {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -1357,3 +1378,42 @@ body[data-section="search"] #split-left { display: none; }
 .search-controls .sc-head button:hover { background: var(--accent-soft); }
 .search-controls .search-row input { flex: 1; min-width: 0; }
 .search-controls .search-row button { flex: 0 0 auto; }
+.search-controls .sc-scope { font-size: var(--fs-xs); color: var(--text-weak); margin-left: auto; }
+/* 搜索层级（组 / 文件，可多选） */
+.search-controls .sc-levels {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px;
+  margin-top: 10px; font-size: var(--fs-sm);
+}
+.search-controls .sc-levels .sc-label { color: var(--text-sub); }
+.search-controls .sc-levels label {
+  display: inline-flex; align-items: center; gap: 4px; cursor: pointer; user-select: none;
+}
+.search-controls .sc-levels input[type="checkbox"] { margin: 0; accent-color: var(--accent); cursor: pointer; }
+/* 附加条件：标签 / 作者 */
+.search-controls .sc-conds {
+  display: flex; flex-direction: column; gap: 0; margin-top: 10px;
+  border-top: 1px solid var(--border); padding-top: 8px;
+}
+.search-controls .sc-cond {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: var(--fs-sm); color: var(--text); cursor: pointer; user-select: none;
+  padding: 3px 0;
+}
+.search-controls .sc-cond input[type="checkbox"] { margin: 0; accent-color: var(--accent); cursor: pointer; }
+.search-controls .sc-cond-box {
+  margin: 4px 0 8px 22px; padding: 10px 12px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+}
+.search-controls .sc-cond-box.hidden { display: none; }
+.search-controls .sc-cond-hint { font-size: var(--fs-xs); color: var(--text-sub); margin-bottom: 6px; }
+.search-controls .sc-cond-input {
+  width: 100%; margin: 6px 0; padding: 5px 8px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel); color: var(--text); font-size: var(--fs-sm);
+}
+.search-controls .sc-cond-bank {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px;
+  max-height: 120px; overflow-y: auto;
+}
+.search-controls .sc-cond-box .tag-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.search-controls .sc-cond-box .hint { font-size: var(--fs-xs); color: var(--text-weak); }

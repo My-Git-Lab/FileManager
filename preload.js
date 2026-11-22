@@ -33,6 +33,7 @@ contextBridge.exposeInMainWorld('api', {
   libAuthorWall: () => ipcRenderer.invoke('lib:authorWall'),
   libSearchTag: (tag) => ipcRenderer.invoke('lib:searchTag', { tag }),
   libSearchAuthor: (author) => ipcRenderer.invoke('lib:searchAuthor', { author }),
+  libSearchAdvanced: (payload) => ipcRenderer.invoke('lib:searchAdvanced', payload),
   libSetCover: (root, groupPath, cover) =>
     ipcRenderer.invoke('lib:setCover', { root, groupPath, cover }),
   libLocations: () => ipcRenderer.invoke('lib:locations'),

@@ -1261,6 +1261,64 @@ function crossLibGroupSearch(field) {
 ipcMain.handle('lib:searchTag', crossLibGroupSearch('tag'));
 ipcMain.handle('lib:searchAuthor', crossLibGroupSearch('author'));
 
+// 跨文库综合检索（v0.4.3 搜索功能区）：按名称 + 层级（组 / 文件）+ 标签 / 作者附加条件。
+// 条件全部为 AND：名称包含在组名 / 文件名中；标签与作者作用于组级（文件沿用所属组），
+// 选中的多个标签 / 作者须同时满足。检索范围为全部已登记文库，每条结果带来源文库名。
+// 只读，不改动任何账本；无任何条件时返回空，避免一次列出整个仓库。
+ipcMain.handle('lib:searchAdvanced', async (e, payload) => {
+  const p = payload || {};
+  const name = String(p.name == null ? '' : p.name).trim().toLowerCase();
+  let levels = Array.isArray(p.levels) ? p.levels.filter(x => x === 'group' || x === 'file') : [];
+  if (!levels.length) levels = ['group', 'file'];          // 未勾层级时默认两级都搜
+  const wantGroup = levels.includes('group');
+  const wantFile = levels.includes('file');
+  const tags = (Array.isArray(p.tags) ? p.tags : []).map(x => String(x).trim()).filter(Boolean);
+  const authors = (Array.isArray(p.authors) ? p.authors : []).map(x => String(x).trim()).filter(Boolean);
+  if (!name && !tags.length && !authors.length) return { list: [] };
+
+  const out = [];
+  let libs = [];
+  try { libs = readRegistry().libraries || []; } catch {}
+  for (const lib of libs) {
+    const root = lib.path;
+    if (!root || !fss.existsSync(root) || !isAllowed(root)) continue;
+    let led;
+    try { led = await readLedger(path.join(root, '.library-index.json'), root); }
+    catch { continue; }
+    const libName = lib.name || path.basename(root);
+    const mm = metaFromLedger(led, root);
+    for (const c of (led.categories || [])) {
+      for (const g of (c.groups || [])) {
+        const meta = mm[relKey(root, g.path)] || emptyMeta();
+        const gTags = (meta.tags || []).map(t => typeof t === 'string' ? t : (t && t.name)).filter(Boolean);
+        const gAuthors = (meta.author || []).map(a => String(a == null ? '' : a).trim()).filter(Boolean);
+        // 标签 / 作者附加条件：须同时满足（AND）
+        if (!tags.every(t => gTags.includes(t))) continue;
+        if (!authors.every(a => gAuthors.includes(a))) continue;
+        const gname = g.displayName || g.name || path.basename(g.path);
+        const catName = c.name || path.basename(c.path);
+        if (wantGroup && (!name || gname.toLowerCase().includes(name))) {
+          out.push({
+            kind: 'group', name: gname, path: g.path, libName,
+            sub: [libName, catName, `${(g.files || []).length} 文件`].filter(Boolean).join(' · ')
+          });
+        }
+        if (wantFile) for (const f of (g.files || [])) {
+          const fname = f.name || path.basename(f.path);
+          if (name && !fname.toLowerCase().includes(name)) continue;
+          out.push({
+            kind: 'file', name: fname, path: f.path, libName, category: f.category,
+            size: f.size || 0,
+            sub: [libName, catName, gname].filter(Boolean).join(' · ')
+          });
+        }
+      }
+    }
+  }
+  out.sort((a, b) => tagCompare(a.libName, b.libName) || tagCompare(a.kind, b.kind) || tagCompare(a.name, b.name));
+  return { list: out };
+});
+
 // 文库列表（注册表内容 + 是否仍存在于磁盘）
 ipcMain.handle('lib:list', async () => {
   const reg = readRegistry();
@@ -1726,6 +1784,7 @@ ipcMain.handle('lib:batchAdd', async (e, payload) => {
   const cleanTags = mergeTags([], (tags || []).map(t => String(t).trim()));
   const cleanAuthor = metaList(author);
   let done = 0;
+  const added = [];                 // 本批真正落地的文件路径，供界面「最近添加」记录用
   const failed = [...expanded.failed];
   for (const src of expanded.files) {
     const base = path.basename(src);
@@ -1739,6 +1798,7 @@ ipcMain.handle('lib:batchAdd', async (e, payload) => {
       // 源文件若来自别的已登记文库，同步它的文件级标签，避免留下孤立键
       if (inAnyLibrary(src)) await rewriteMeta(src, dest, false).catch(() => {});
       reserved.add(norm(name));
+      added.push(dest);
       done++;
     } catch (err) {
       failed.push({ src, reason: err.message });
@@ -1754,7 +1814,7 @@ ipcMain.handle('lib:batchAdd', async (e, payload) => {
     });
   } catch (err) { console.log('[批次] 组信息写入失败：' + err.message); }
 
-  return { ok: true, root, groupPath, done, failed, skipped: expanded.skipped };
+  return { ok: true, root, groupPath, done, added, failed, skipped: expanded.skipped };
 });
 
 // Windows 的 NTFS 不区分大小写：仅改大小写时 existsSync(新名) 也会返回 true，

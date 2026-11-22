@@ -16,12 +16,23 @@ const CAT_CHIPS = ['全部', '图片', '视频', '文档', '音频', '压缩包'
 const state = {
   homeDirs: {},
   openHistory: JSON.parse(localStorage.getItem('fm_open_history') || '[]'),
+  // 「最近添加」：通过「添加文件 / 批量添加」导入文库的文件，最多 10 条
+  recentAdded: JSON.parse(localStorage.getItem('fm_recent_added') || '[]'),
+  recentHidden: localStorage.getItem('fm_recent_hidden') === '1',
+  historyHidden: localStorage.getItem('fm_history_hidden') === '1',
   // 中间阅览区当前视图：libs 全部文库 | lib 单个文库首页 | cat 大类 | group 组 | search 检索结果
   view: 'libs',
   // 检索方式：cat 按分类 | tag 按标签 | author 按作者（三态循环）
   searchMode: ['cat', 'tag', 'author'].includes(localStorage.getItem('fm_search_mode'))
     ? localStorage.getItem('fm_search_mode') : 'cat',
-  historyHidden: localStorage.getItem('fm_history_hidden') === '1',
+  // 跨库综合检索（v0.4.3 搜索功能区）：范围为全部文库
+  advName: '',                                        // 按名称关键词
+  advLevels: new Set(['group', 'file']),              // 搜索层级（组 / 文件，可多选）
+  advTagOn: false, advTags: [],                       // 标签附加条件（需同时满足）
+  advAuthorOn: false, advAuthors: [],                 // 作者附加条件（需同时满足）
+  advBankTags: [], advBankAuthors: [],                // 跨库已有标签 / 作者候选
+  searchPageNum: 1,                                    // 搜索结果当前页（每页 20 条）
+  advBankTagPage: 1, advBankAuthorPage: 1,             // 搜索附加条件候选列表当前页（每页 25 个）
   // 阅览区导航历史（前进 / 后退）
   nav: { stack: [], index: -1 },
   navLock: false,
@@ -170,6 +181,7 @@ function tagBankSectionHTML(query, hint) {
       <button id="tb-refresh" type="button">刷新</button>
     </div>
     <div class="tb-list" id="tb-list"></div>
+    <div id="tb-pager"></div>
     <div class="hint">${hint || '候选是各文库当前仍在使用的标签（按名称排序）；点一下加入，再点一下移除。'}</div>
   </div>`;
 }
@@ -178,19 +190,33 @@ function tagBankSectionHTML(query, hint) {
 //   · 批量添加：真源是 batchState.tags（setNames 里整表重绘）
 //   · single：改名弹窗，点一个标签就把输入框换成这个名字
 function bindTagBankSection(opts) {
-  const { getNames, setNames, single, scope, onAfter, onQuery } = opts;
+  const { getNames, setNames, single, scope, onAfter, onQuery, getPage, setPage } = opts;
   const rootEl = scope || document;
   const search = rootEl.querySelector('#tb-search');
   const list = rootEl.querySelector('#tb-list');
+  const pager = rootEl.querySelector('#tb-pager');
   const count = rootEl.querySelector('#tb-count');
   if (!list) return () => {};
+  // 页码：外部可托管（批量添加整表重绘时保留页码），否则用局部状态
+  let localPage = 1;
+  const gp = getPage || (() => localPage);
+  const sp = setPage || ((v) => { localPage = v; });
   const paint = () => {
     const q = (search ? search.value : '').trim().toLowerCase();
     const cur = getNames();
     const shown = tagBankData.filter(t => !q || t.name.toLowerCase().includes(q));
-    list.innerHTML = shown.length
-      ? shown.map(t => tagBankChipHTML(t, cur.includes(t.name))).join('')
+    const pages = Math.max(1, Math.ceil(shown.length / CHIP_PAGE_SIZE));
+    let page = gp();
+    if (page > pages) { page = pages; sp(page); }
+    if (page < 1) { page = 1; sp(page); }
+    const slice = shown.slice((page - 1) * CHIP_PAGE_SIZE, page * CHIP_PAGE_SIZE);
+    list.innerHTML = slice.length
+      ? slice.map(t => tagBankChipHTML(t, cur.includes(t.name))).join('')
       : `<span class="hint">${tagBankData.length ? '没有匹配这个关键字的标签' : '还没有任何文库记录过标签，先在上方手动输入几个吧'}</span>`;
+    if (pager) {
+      pager.innerHTML = chipPagerHTML(page, pages, 'tbbpg');
+      bindChipPager(pager, 'tbbpg', gp, sp, paint);
+    }
     if (count) count.textContent = tagBankData.length
       ? `共 ${tagBankData.length} 个 · 已选 ${cur.length} 个` : '';
     list.querySelectorAll('.tb-chip').forEach(chip => {
@@ -206,7 +232,7 @@ function bindTagBankSection(opts) {
     });
   };
   if (search) {
-    search.addEventListener('input', () => { if (onQuery) onQuery(search.value); paint(); });
+    search.addEventListener('input', () => { sp(1); if (onQuery) onQuery(search.value); paint(); });
     // 搜索框里的回车只用于筛选，不要连带触发弹窗的「确定」
     search.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !isComposing(e)) e.preventDefault(); });
   }
@@ -237,29 +263,43 @@ function authorBankSectionHTML(query, hint) {
       <button id="ab-refresh" type="button">刷新</button>
     </div>
     <div class="tb-list" id="ab-list"></div>
+    <div id="ab-pager"></div>
     <div class="hint">${hint || '候选是各文库当前仍在使用的作者（按名称排序）；点一下加入，再点一下移除。'}</div>
   </div>`;
 }
 // 与 bindTagBankSection 同构，真源是各自传来的名字集合（作者用「、」分隔文本框 / batchState.author）。
 function bindAuthorBankSection(opts) {
-  const { getNames, setNames, scope, onAfter, onQuery } = opts;
+  const { getNames, setNames, scope, onAfter, onQuery, getPage, setPage } = opts;
   const rootEl = scope || document;
   const search = rootEl.querySelector('#ab-search');
   const list = rootEl.querySelector('#ab-list');
+  const pager = rootEl.querySelector('#ab-pager');
   const count = rootEl.querySelector('#ab-count');
   if (!list) return () => {};
+  let localPage = 1;
+  const gp = getPage || (() => localPage);
+  const sp = setPage || ((v) => { localPage = v; });
   const paint = () => {
     const q = (search ? search.value : '').trim().toLowerCase();
     const cur = getNames();
     const shown = authorBankData.filter(t => !q || t.name.toLowerCase().includes(q));
-    list.innerHTML = shown.length
-      ? shown.map(t => {
+    const pages = Math.max(1, Math.ceil(shown.length / CHIP_PAGE_SIZE));
+    let page = gp();
+    if (page > pages) { page = pages; sp(page); }
+    if (page < 1) { page = 1; sp(page); }
+    const slice = shown.slice((page - 1) * CHIP_PAGE_SIZE, page * CHIP_PAGE_SIZE);
+    list.innerHTML = slice.length
+      ? slice.map(t => {
         const libs = (t.libs || []).join('、');
         const sel = cur.includes(t.name);
         return `<span class="tag-chip tb-chip${sel ? ' active' : ''}" data-ab="${escapeHtml(t.name)}" `
           + `title="${escapeHtml(libs ? '来自：' + libs : '已有作者')}">${escapeHtml(t.name)}</span>`;
       }).join('')
       : `<span class="hint">${authorBankData.length ? '没有匹配这个关键字的作者' : '还没有任何文库记录过作者，先在上方手动输入几个吧'}</span>`;
+    if (pager) {
+      pager.innerHTML = chipPagerHTML(page, pages, 'abbpg');
+      bindChipPager(pager, 'abbpg', gp, sp, paint);
+    }
     if (count) count.textContent = authorBankData.length
       ? `共 ${authorBankData.length} 个 · 已选 ${cur.length} 个` : '';
     list.querySelectorAll('.tb-chip').forEach(chip => {
@@ -273,7 +313,7 @@ function bindAuthorBankSection(opts) {
     });
   };
   if (search) {
-    search.addEventListener('input', () => { if (onQuery) onQuery(search.value); paint(); });
+    search.addEventListener('input', () => { sp(1); if (onQuery) onQuery(search.value); paint(); });
     search.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !isComposing(e)) e.preventDefault(); });
   }
   const btn = rootEl.querySelector('#ab-refresh');
@@ -540,20 +580,68 @@ function removeOpenHistory(p) {
   localStorage.setItem('fm_open_history', JSON.stringify(state.openHistory));
   renderHistory();
 }
-$('#btn-clear-history').onclick = () => {
+$('#btn-clear-history').onclick = () => clearHistoryRecords();
+function clearHistoryRecords() {
   if (!state.openHistory.length) { toast('历史记录已经是空的'); return; }
   showModal('清空历史记录', `<div class="hint">确定清空全部 ${state.openHistory.length} 条历史记录？此操作不可恢复。</div>`, async () => {
     state.openHistory = [];
     localStorage.setItem('fm_open_history', '[]');
     renderHistory();
+    if (state.section === 'records') renderRecordsStage();
     toast('历史记录已清空');
   }, '清空');
-};
+}
 
-// ---------- 分类筛选 chips（文库内文件类型） ----------
+// ---------- 最近添加（导入文库的文件，最多 10 条） ----------
+function catOfPath(p) {
+  const ext = String(p || '').split('.').pop().toLowerCase();
+  if (['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg', 'heic', 'tiff', 'ico'].includes(ext)) return '图片';
+  if (['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v', 'ts'].includes(ext)) return '视频';
+  if (['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a', 'wma'].includes(ext)) return '音频';
+  if (['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'iso'].includes(ext)) return '压缩包';
+  if (TEXT_EXTS.has(ext)) return '文档';
+  return '其他';
+}
+// paths: 落地后的绝对路径数组；libName: 所属文库名
+function addRecentAdded(paths, libNameOrRoot) {
+  const arr = Array.isArray(paths) ? paths : [];
+  if (!arr.length) return;
+  // 允许传库名或库根目录路径；路径则从注册表解析出名字
+  let libName = libNameOrRoot || '';
+  if (libName && /[\\/]/.test(libName)) {
+    const hit = (state.libLibraries || []).find(l => l.path === libName);
+    libName = hit ? hit.name : libName.split(/[\\/]/).pop();
+  }
+  const now = Date.now();
+  for (const p of arr) {
+    if (!p) continue;
+    state.recentAdded = state.recentAdded.filter(x => x.path !== p);
+    state.recentAdded.unshift({
+      path: p, name: p.split(/[\\/]/).pop(), category: catOfPath(p),
+      libName: libName || '', at: now
+    });
+  }
+  if (state.recentAdded.length > 10) state.recentAdded.length = 10;
+  localStorage.setItem('fm_recent_added', JSON.stringify(state.recentAdded));
+  if (state.section === 'records') renderRecordsStage();
+}
+function clearRecentAdded() {
+  if (!state.recentAdded.length) { toast('「最近添加」已经是空的'); return; }
+  showModal('清空最近添加', `<div class="hint">确定清空全部 ${state.recentAdded.length} 条「最近添加」记录？此操作只清记录，不会删除文件。</div>`, async () => {
+    state.recentAdded = [];
+    localStorage.setItem('fm_recent_added', '[]');
+    if (state.section === 'records') renderRecordsStage();
+    toast('「最近添加」已清空');
+  }, '清空');
+}
+
+// ---------- 分类筛选 chips（兼容旧逻辑，v0.4.3 起不再显示） ----------
 function buildCatChips() {
   const box = $('#cat-chips');
-  box.classList.toggle('hidden', state.searchMode !== 'cat');
+  // 这些旧 chips 容器只存在于搜索功能区，已由「按标签 / 按作者」附加条件控件取代。
+  // 旧逻辑会按 state.searchMode 把它们显示出来，导致未勾选时也冒出一批标签，故强制常隐。
+  if (box) box.classList.add('hidden');
+  if (!box) return;
   box.innerHTML = '';
   for (const c of CAT_CHIPS) {
     const chip = document.createElement('span');
@@ -569,14 +657,174 @@ function buildCatChips() {
   }
 }
 
-// ---------- 文库搜索（文库内文件名） ----------
-$('#btn-search').onclick = runLibSearch;
-bindEnter($('#search-input'), runLibSearch);              // 回车搜索
-bindLiveInput($('#search-input'), runLibSearch);         // 边打字边搜（等中文上屏后再搜）
-function runLibSearch() {
-  state.libSearch = $('#search-input').value.trim();
-  applyFilterView();
-  renderCurrentView();
+// ---------- 跨库综合检索（v0.4.3 搜索功能区） ----------
+// 搜索范围为全部文库：名称（组 / 文件）+ 标签 / 作者附加条件，全部为 AND。
+$('#btn-search').onclick = runAdvSearch;
+bindEnter($('#search-input'), runAdvSearch);              // 回车搜索
+bindLiveInput($('#search-input'), runAdvSearch);         // 边打字边搜（等中文上屏后再搜）
+function runLibSearch() { return runAdvSearch(); }        // 兼容旧调用点
+async function runAdvSearch() {
+  state.advName = ($('#search-input') ? $('#search-input').value : '').trim();
+  state.searchPageNum = 1;   // 每次重新检索回到第一页
+  if (typeof window.api.libSearchAdvanced !== 'function') {
+    filterInfo = { list: [], mode: 'plain', adv: true, error: '当前版本不支持跨库检索' };
+    renderSearchStage();
+    return;
+  }
+  const payload = {
+    name: state.advName,
+    levels: [...state.advLevels],
+    tags: state.advTagOn ? state.advTags.slice() : [],
+    authors: state.advAuthorOn ? state.advAuthors.slice() : []
+  };
+  // 没有任何条件：给出空结果，避免一次列出全部
+  if (!payload.name && !payload.tags.length && !payload.authors.length) {
+    filterInfo = { list: [], mode: 'plain', adv: true, emptyHint: true };
+    renderSearchStage();
+    return;
+  }
+  filterInfo = { list: [], mode: 'plain', adv: true, loading: true };
+  renderSearchStage();
+  try {
+    const res = await window.api.libSearchAdvanced(payload);
+    const raw = (res && Array.isArray(res.list)) ? res.list : [];
+    const list = raw.map(x => ({
+      kind: x.kind, name: x.name, path: x.path,
+      icon: x.kind === 'group' ? '🗂' : (ICONS[x.category] || '📃'),
+      sub: x.sub || '', libName: x.libName || ''
+    }));
+    filterInfo = { list, mode: 'plain', adv: true, cond: payload };
+  } catch (err) {
+    filterInfo = { list: [], mode: 'plain', adv: true, error: String(err && err.message || err) };
+  }
+  renderSearchStage();
+}
+
+// 标签 / 作者附加条件控件：勾选后展开，点选候选或输入后回车加入（多选 = 同时满足）
+function chipSelectedHTML(names, kind, colorMap) {
+  if (!names.length) return '<span class="hint">尚未选择</span>';
+  return names.map(n => {
+    const color = colorMap && colorMap[n] ? `style="--tag-c:${safeTagColor(colorMap[n], n)}"` : '';
+    return `<span class="tag-chip active" data-remove="${escapeHtml(n)}" data-kind="${kind}" ${color}>${escapeHtml(n)} ✕</span>`;
+  }).join('');
+}
+function candidateHTML(entries, selected, kind) {
+  if (!entries.length) return '<span class="hint">暂无跨库候选</span>';
+  return entries.map(e => {
+    const name = e.name;
+    const active = selected.includes(name);
+    const color = e.color ? `style="--tag-c:${safeTagColor(e.color, name)}"` : '';
+    return `<span class="tag-chip${active ? ' active' : ''}" data-toggle="${escapeHtml(name)}" data-kind="${kind}" ${color} title="${escapeHtml((e.libs || []).join('、'))}">${escapeHtml(name)}</span>`;
+  }).join('');
+}
+function renderAdvCondControls() {
+  const tagOn = state.advTagOn, authorOn = state.advAuthorOn;
+  const tBox = $('#cond-tag-box'), aBox = $('#cond-author-box');
+  if (tBox) tBox.classList.toggle('hidden', !tagOn);
+  if (aBox) aBox.classList.toggle('hidden', !authorOn);
+  const tagColorMap = {};
+  for (const t of state.advBankTags) if (t.color) tagColorMap[t.name] = t.color;
+  const tSel = $('#cond-tag-selected');
+  if (tSel && tagOn) {
+    tSel.innerHTML = chipSelectedHTML(state.advTags, 'tag', tagColorMap);
+    tSel.querySelectorAll('[data-remove]').forEach(ch => ch.onclick = () => {
+      state.advTags = state.advTags.filter(x => x !== ch.dataset.remove);
+      renderAdvCondControls(); runAdvSearch();
+    });
+  }
+  const aSel = $('#cond-author-selected');
+  if (aSel && authorOn) {
+    aSel.innerHTML = chipSelectedHTML(state.advAuthors, 'author', null);
+    aSel.querySelectorAll('[data-remove]').forEach(ch => ch.onclick = () => {
+      state.advAuthors = state.advAuthors.filter(x => x !== ch.dataset.remove);
+      renderAdvCondControls(); runAdvSearch();
+    });
+  }
+  const tBank = $('#cond-tag-bank'), tPager = $('#cond-tag-pager');
+  if (tBank && tagOn) {
+    const pages = Math.max(1, Math.ceil(state.advBankTags.length / CHIP_PAGE_SIZE));
+    if (state.advBankTagPage > pages) state.advBankTagPage = pages;
+    if (state.advBankTagPage < 1) state.advBankTagPage = 1;
+    const p = state.advBankTagPage;
+    const slice = state.advBankTags.slice((p - 1) * CHIP_PAGE_SIZE, p * CHIP_PAGE_SIZE);
+    tBank.innerHTML = candidateHTML(slice, state.advTags, 'tag');
+    tBank.querySelectorAll('[data-toggle]').forEach(ch => ch.onclick = () => {
+      const n = ch.dataset.toggle;
+      state.advTags = state.advTags.includes(n) ? state.advTags.filter(x => x !== n) : [...state.advTags, n];
+      renderAdvCondControls(); runAdvSearch();
+    });
+    if (tPager) {
+      tPager.innerHTML = chipPagerHTML(p, pages, 'ctbp');
+      bindChipPager(tPager, 'ctbp', () => state.advBankTagPage,
+        (v) => { state.advBankTagPage = v; }, renderAdvCondControls);
+    }
+  }
+  const aBank = $('#cond-author-bank'), aPager = $('#cond-author-pager');
+  if (aBank && authorOn) {
+    const pages = Math.max(1, Math.ceil(state.advBankAuthors.length / CHIP_PAGE_SIZE));
+    if (state.advBankAuthorPage > pages) state.advBankAuthorPage = pages;
+    if (state.advBankAuthorPage < 1) state.advBankAuthorPage = 1;
+    const p = state.advBankAuthorPage;
+    const slice = state.advBankAuthors.slice((p - 1) * CHIP_PAGE_SIZE, p * CHIP_PAGE_SIZE);
+    aBank.innerHTML = candidateHTML(slice, state.advAuthors, 'author');
+    aBank.querySelectorAll('[data-toggle]').forEach(ch => ch.onclick = () => {
+      const n = ch.dataset.toggle;
+      state.advAuthors = state.advAuthors.includes(n) ? state.advAuthors.filter(x => x !== n) : [...state.advAuthors, n];
+      renderAdvCondControls(); runAdvSearch();
+    });
+    if (aPager) {
+      aPager.innerHTML = chipPagerHTML(p, pages, 'cabp');
+      bindChipPager(aPager, 'cabp', () => state.advBankAuthorPage,
+        (v) => { state.advBankAuthorPage = v; }, renderAdvCondControls);
+    }
+  }
+}
+function bindAdvCondControls() {
+  const ct = $('#cond-tag-on'), ca = $('#cond-author-on');
+  if (ct) { ct.checked = state.advTagOn; ct.onchange = () => {
+    state.advTagOn = ct.checked; renderAdvCondControls(); runAdvSearch();
+  }; }
+  if (ca) { ca.checked = state.advAuthorOn; ca.onchange = () => {
+    state.advAuthorOn = ca.checked; renderAdvCondControls(); runAdvSearch();
+  }; }
+  // 层级勾选（组 / 文件，可多选）
+  $$('#search-controls .sc-levels input[data-level]').forEach(cb => {
+    cb.checked = state.advLevels.has(cb.dataset.level);
+    cb.onchange = () => {
+      if (cb.checked) state.advLevels.add(cb.dataset.level);
+      else state.advLevels.delete(cb.dataset.level);
+      // 至少保留一个层级
+      if (!state.advLevels.size) { state.advLevels.add(cb.dataset.level); cb.checked = true; return; }
+      runAdvSearch();
+    };
+  });
+  const bindAdd = (inputSel, arrKey) => {
+    const inp = $(inputSel);
+    if (!inp) return;
+    bindEnter(inp, () => {
+      const v = inp.value.trim();
+      if (!v) return;
+      if (!state[arrKey].includes(v)) state[arrKey].push(v);
+      inp.value = '';
+      renderAdvCondControls(); runAdvSearch();
+    });
+  };
+  bindAdd('#cond-tag-input', 'advTags');
+  bindAdd('#cond-author-input', 'advAuthors');
+}
+// 跨库候选（标签 / 作者）来自主进程并集，进入搜索区时按需刷新
+async function refreshAdvBanks() {
+  try {
+    if (window.api.libTagBanks) {
+      const r = await window.api.libTagBanks();
+      state.advBankTags = ((r && r.tags) || []).map(t => ({ name: t.name, libs: t.libs || [] }));
+    }
+    if (window.api.libAuthorBanks) {
+      const r = await window.api.libAuthorBanks();
+      state.advBankAuthors = ((r && r.authors) || []).map(a => ({ name: a.name, libs: a.libs || [] }));
+    }
+  } catch {}
+  renderAdvCondControls();
 }
 
 // 清空搜索与类型筛选（点击具体大类/组时调用，保持界面直觉）
@@ -610,11 +858,14 @@ function renderCurrentView() {
       if (state.libSel?.type === 'group') showGroupPreview(state.libSel.data);
       else { state.view = 'lib'; showLibraryHome(); }
       break;
-    case 'search': showLibFilterView(); break;
+    case 'search':
+      // 搜索功能区（全宽舞台）自己维护跨库结果，不再走库内筛选视图
+      if (state.section !== 'search') showLibFilterView();
+      break;
     default: showLibrariesView();
   }
   updateFileNavButtons();
-  // 全宽「搜索」区块与中间检索视图共用筛选状态，需同步刷新结果
+  // 搜索功能区激活时只重绘自己的舞台，避免库内渲染覆盖跨库结果
   if (state.section === 'search') renderSearchStage();
 }
 // ---------- 左侧功能导航（仪表盘 / 文库操作 / 搜索 / 记录） ----------
@@ -638,39 +889,31 @@ function setSection(name) {
   // 各区块自有渲染
   if (name === 'dashboard') renderDashboard();
   else if (name === 'records') renderRecordsStage();
-  else if (name === 'search') renderSearchStage();
+  else if (name === 'search') {
+    if (!state._advBound) { bindAdvCondControls(); state._advBound = true; }
+    renderAdvCondControls();
+    renderSearchStage();
+    refreshAdvBanks();                 // 刷新跨库标签 / 作者候选（异步）
+  }
   else { renderCurrentView(); renderBreadcrumb(); }
 }
 
-// 仪表盘标签墙 / 作者墙点击条目：跨库检索该值，切换到「搜索」功能区展示组级结果。
+// 仪表盘标签墙 / 作者墙点击条目：把该值设为搜索功能区的附加条件，切到「搜索」并跨库检索。
+// 复用统一的 lib:searchAdvanced（组 / 文件两级），与功能区内的手动检索口径一致。
 async function crossLibSearchFromWall(kind, value) {
   const val = String(value == null ? '' : value).trim();
   if (!val) return;
   const isTag = kind === 'tag';
-  const apiName = isTag ? 'libSearchTag' : 'libSearchAuthor';
-  const label = isTag ? '标签' : '作者';
-  if (typeof window.api[apiName] !== 'function') { toast('当前版本不支持跨库' + label + '检索'); return; }
-  let res;
-  try { res = await window.api[apiName](val); }
-  catch (err) { toast(label + '检索失败：' + (err && err.message || err)); return; }
-  const raw = (res && Array.isArray(res.list)) ? res.list : [];
-  // 映射成搜索结果项结构（只含组级），并补上来源文库，便于跨库同名组区分
-  const list = raw.map(x => ({
-    kind: x.kind || 'group', name: x.name, path: x.path, icon: '🗂',
-    sub: [x.libName, x.sub].filter(Boolean).join(' · ')
-  }));
-  filterInfo = { list, kw: '', cat: '全部', tag: isTag ? val : null, author: isTag ? null : val,
-    mode: isTag ? 'tag' : 'author', crossLib: true };
-  state.searchMode = isTag ? 'tag' : 'author';
-  // 同步搜索控件区的模式文案与候选显隐，避免跨库跳转后按钮停留在旧模式
-  state.libCatFilter = '全部';
-  state.libTagFilter = null;
-  state.libAuthorFilter = null;
-  renderSearchMode();
-  buildCatChips();
-  renderTagChips();
-  renderAuthorChips();
-  setSection('search');
+  // 先清掉另一类条件，避免上次的选择污染本次跳转
+  state.advTagOn = isTag;
+  state.advAuthorOn = !isTag;
+  state.advTags = isTag ? [val] : [];
+  state.advAuthors = isTag ? [] : [val];
+  state.advName = '';
+  if ($('#search-input')) $('#search-input').value = '';
+  setSection('search');                 // 内部完成首次绑定与候选刷新
+  renderAdvCondControls();              // 同步刚设置的勾选 / 已选条件
+  await runAdvSearch();
 }
 function searchTagFromWall(tag) { return crossLibSearchFromWall('tag', tag); }
 function searchAuthorFromWall(author) { return crossLibSearchFromWall('author', author); }
@@ -838,66 +1081,144 @@ function renderSearchStage() {
   const box = $('#search-stage-body');
   if (!box) return;
   const list = Array.isArray(filterInfo.list) ? filterInfo.list : [];
-  const mode = filterInfo.mode || 'plain';
-  const modeChip = mode === 'tag' ? '按标签' : mode === 'author' ? '按作者' : '按分类';
-  const chips = `<span class="stage-chip active">${modeChip}</span>`;
-  const cond = [
-    filterInfo.kw ? '关键词：' + escapeHtml(filterInfo.kw) : null,
-    filterInfo.tag ? '标签：' + escapeHtml(filterInfo.tag) : null,
-    filterInfo.author ? '作者：' + escapeHtml(filterInfo.author) : null,
-    filterInfo.cat !== '全部' ? '分类：' + escapeHtml(filterInfo.cat) : null
-  ].filter(Boolean).join('　');
-  const crossLib = !!filterInfo.crossLib;
-  const groupMode = mode === 'tag' || mode === 'author';
-  let rows = '';
-  if (!list.length) {
-    rows = '<div class="stage-empty"><div class="big">🔍</div><div>没有匹配的结果</div><div class="empty-sub">在上方调整筛选条件，或切换检索方式</div></div>';
+  const adv = !!filterInfo.adv;
+  // 结果分页（每页 20 条）
+  const total = list.length;
+  const pages = Math.max(1, Math.ceil(total / SEARCH_PAGE_SIZE));
+  if (state.searchPageNum > pages) state.searchPageNum = pages;
+  if (state.searchPageNum < 1) state.searchPageNum = 1;
+  const page = state.searchPageNum;
+  const pageList = list.slice((page - 1) * SEARCH_PAGE_SIZE, page * SEARCH_PAGE_SIZE);
+  // 条件摘要
+  let cond = '';
+  if (adv && filterInfo.cond) {
+    const c = filterInfo.cond;
+    cond = [
+      c.name ? '名称：' + escapeHtml(c.name) : null,
+      '层级：' + escapeHtml((c.levels || []).map(l => l === 'group' ? '组' : '文件').join('/') || '—'),
+      (c.tags || []).length ? '标签：' + escapeHtml(c.tags.join(' + ')) : null,
+      (c.authors || []).length ? '作者：' + escapeHtml(c.authors.join(' + ')) : null
+    ].filter(Boolean).join('　');
   } else {
-    rows = `<div class="search-results">` + list.map(x => {
-      const name = groupMode ? x.name : x.file.name;
-      const sub = groupMode ? (crossLib ? escapeHtml(x.sub || '') : x.sub)
-        : escapeHtml(x.group.displayName) + ' · ' + fmtSize(x.file.size);
-      const icon = groupMode ? (x.icon || '🗂') : (ICONS[x.file.category] || '📃');
-      const level = groupMode ? `<span class="res-level">组</span>` : '';
-      const dp = crossLib && x.path && x.kind === 'file' ? ` data-path="${escapeHtml(x.path)}"` : '';
+    cond = [
+      filterInfo.kw ? '关键词：' + escapeHtml(filterInfo.kw) : null,
+      filterInfo.tag ? '标签：' + escapeHtml(filterInfo.tag) : null,
+      filterInfo.author ? '作者：' + escapeHtml(filterInfo.author) : null
+    ].filter(Boolean).join('　');
+  }
+  let rows = '';
+  if (filterInfo.loading) {
+    rows = '<div class="stage-empty"><div class="big">🔍</div><div>正在检索全部文库…</div></div>';
+  } else if (filterInfo.error) {
+    rows = '<div class="stage-empty"><div class="big">⚠️</div><div>检索失败</div><div class="empty-sub">' + escapeHtml(filterInfo.error) + '</div></div>';
+  } else if (!list.length) {
+    const hint = filterInfo.emptyHint
+      ? '输入名称，或勾选标签 / 作者条件后再检索'
+      : '在上方调整条件后再试（标签 / 作者为需同时满足的附加条件）';
+    rows = '<div class="stage-empty"><div class="big">🔍</div><div>没有匹配的结果</div><div class="empty-sub">' + hint + '</div></div>';
+  } else {
+    rows = `<div class="search-results">` + pageList.map(x => {
+      // 跨库结果项：{kind,name,path,icon,sub,libName}；旧库内文件项：{file,group}
+      const isFlat = x && x.name !== undefined && x.file === undefined;
+      const name = isFlat ? x.name : (x.file && x.file.name) || '';
+      const sub = isFlat ? escapeHtml(x.sub || '') : (x.group ? escapeHtml(x.group.displayName) + ' · ' + fmtSize(x.file.size) : '');
+      const icon = isFlat ? (x.icon || (x.kind === 'group' ? '🗂' : '📃')) : (ICONS[x.file.category] || '📃');
+      const level = isFlat ? `<span class="res-level">${x.kind === 'group' ? '组' : '文件'}</span>` : '';
+      const dp = x.path ? ` data-path="${escapeHtml(x.path)}" data-kind="${escapeHtml(x.kind || (isFlat ? '' : 'file'))}"` : '';
       return `<div class="res-row"${dp}><span class="res-ico">${icon}</span><span class="res-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>${level}<span class="res-sub">${sub}</span></div>`;
     }).join('') + `</div>`;
   }
   box.innerHTML = `
-    <div class="stage-title"><span>🔍 搜索</span><span class="stage-sub">共 ${list.length} 项结果${crossLib ? '（全部文库）' : ''}${groupMode ? '（仅组级）' : ''}</span></div>
-    <div class="stage-toolbar">${chips}${crossLib ? '<span class="stage-chip">跨文库</span>' : ''}<span class="toolbar-cond">${cond || '未设置筛选条件'}</span></div>
-    ${rows}`;
-  if (crossLib) {
-    box.querySelectorAll('[data-path]').forEach(el => {
-      el.title = '双击打开：' + el.dataset.path;
-      el.ondblclick = () => openEntry({ path: el.dataset.path, name: el.querySelector('.res-name')?.textContent || '', isDir: false });
-    });
-  }
+    <div class="stage-title"><span>🔍 搜索</span><span class="stage-sub">共 ${total} 项结果 · 全部文库</span></div>
+    <div class="stage-toolbar"><span class="stage-chip active">跨文库</span><span class="stage-chip">组 / 文件</span><span class="toolbar-cond">${cond || '未设置筛选条件'}</span></div>
+    ${rows}
+    ${pagerHTML(page, pages, { prev: 'spg-prev', next: 'spg-next' })}`;
+  bindPager(box, renderSearchStage, {
+    ids: { prev: 'spg-prev', next: 'spg-next' },
+    getPage: () => state.searchPageNum,
+    setPage: (v) => { state.searchPageNum = v; }
+  });
+  box.querySelectorAll('[data-path]').forEach(el => {
+    const isGroup = el.dataset.kind === 'group';
+    el.title = (isGroup ? '双击打开组文件夹：' : '双击打开：') + el.dataset.path;
+    el.ondblclick = () => {
+      if (isGroup) { window.api.showInFolder(el.dataset.path); return; }
+      openEntry({ path: el.dataset.path, name: el.querySelector('.res-name')?.textContent || '', isDir: false });
+    };
+  });
 }
 
-// 记录（全宽初版）：打开历史记录
+// 记录（全宽上下布局）：上「最近添加」、下「打开历史」，各最多 10 条，各自可隐藏 / 清空
+function recordRowsHTML(items, attr) {
+  if (!items.length) return '<div class="list-empty" style="padding:10px">暂无记录</div>';
+  return `<div class="records-list">` + items.map(h =>
+    `<div class="res-row" ${attr}="${escapeHtml(h.path)}"><span class="res-ico">${ICONS[h.category] || '📃'}</span>
+      <span class="res-name" title="${escapeHtml(h.path)}">${escapeHtml(h.name)}</span>
+      <span class="res-sub">${escapeHtml(h.libName ? h.libName + ' · ' : '')}${escapeHtml(h.path)}</span></div>`).join('') + `</div>`;
+}
 function renderRecordsStage() {
   const box = $('#records-stage-body');
   if (!box) return;
-  const hs = state.openHistory.slice(0, 50);
-  const list = hs.length ? `<div class="records-list">` + hs.map(h =>
-    `<div class="res-row" data-rec="${escapeHtml(h.path)}"><span class="res-ico">${ICONS[h.category] || '📃'}</span>
-      <span class="res-name" title="${escapeHtml(h.path)}">${escapeHtml(h.name)}</span>
-      <span class="res-sub">${escapeHtml(h.path)}</span></div>`).join('') + `</div>`
-    : '<div class="stage-empty"><div class="big">🕘</div><div>暂无记录</div><div class="empty-sub">用系统程序打开过的文件会出现在这里</div></div>';
+  const recent = state.recentAdded.slice(0, 10);
+  const hist = state.openHistory.slice(0, 10);
   box.innerHTML = `
-    <div class="stage-title"><span>🕘 记录</span><span class="stage-sub">打开历史（初版，共 ${hs.length} 条）</span>
-      <button id="stage-clear-history" class="stage-act">清空</button></div>
-    ${list}`;
+    <div class="stage-title"><span>🕘 记录</span><span class="stage-sub">最近添加与打开历史，各保留最近 10 条</span></div>
+    <div class="stage-panel rec-panel">
+      <div class="panel-title rec-title">
+        <span>📥 最近添加 <span class="rec-count">${state.recentAdded.length} / 10</span></span>
+        <span class="rec-acts">
+          <button id="rec-toggle-recent" class="stage-act">${state.recentHidden ? '展开' : '隐藏'}</button>
+          <button id="rec-clear-recent" class="stage-act">清空</button>
+        </span>
+      </div>
+      <div id="rec-recent-body" class="rec-body${state.recentHidden ? ' hidden' : ''}">
+        ${recent.length ? recordRowsHTML(recent, 'data-recent')
+          : '<div class="stage-empty"><div class="big">📥</div><div>暂无最近添加</div><div class="empty-sub">通过「添加文件 / 批量添加」导入的文件会出现在这里</div></div>'}
+      </div>
+    </div>
+    <div class="stage-panel rec-panel" style="margin-top:14px">
+      <div class="panel-title rec-title">
+        <span>🕘 打开历史 <span class="rec-count">${state.openHistory.length} / 10</span></span>
+        <span class="rec-acts">
+          <button id="rec-toggle-history" class="stage-act">${state.historyHidden ? '展开' : '隐藏'}</button>
+          <button id="rec-clear-history" class="stage-act">清空</button>
+        </span>
+      </div>
+      <div id="rec-history-body" class="rec-body${state.historyHidden ? ' hidden' : ''}">
+        ${hist.length ? recordRowsHTML(hist, 'data-rec')
+          : '<div class="stage-empty"><div class="big">🕘</div><div>暂无打开历史</div><div class="empty-sub">用系统程序打开过的文件会出现在这里</div></div>'}
+      </div>
+    </div>`;
+  // 点击记录：打开文件
+  box.querySelectorAll('[data-recent]').forEach(el => {
+    el.onclick = () => {
+      const h = state.recentAdded.find(x => x.path === el.dataset.recent);
+      if (h) openEntry({ path: h.path, name: h.name, isDir: false, category: h.category });
+    };
+  });
   box.querySelectorAll('[data-rec]').forEach(el => {
     el.onclick = () => {
       const h = state.openHistory.find(x => x.path === el.dataset.rec);
-      if (!h) return;
-      openEntry({ path: h.path, name: h.name, isDir: false, category: h.category });
+      if (h) openEntry({ path: h.path, name: h.name, isDir: false, category: h.category });
     };
   });
-  const clr = $('#stage-clear-history');
-  if (clr) clr.onclick = () => $('#btn-clear-history')?.click();
+  // 隐藏 / 清空
+  const tglR = $('#rec-toggle-recent');
+  if (tglR) tglR.onclick = () => {
+    state.recentHidden = !state.recentHidden;
+    localStorage.setItem('fm_recent_hidden', state.recentHidden ? '1' : '0');
+    renderRecordsStage();
+  };
+  const tglH = $('#rec-toggle-history');
+  if (tglH) tglH.onclick = () => {
+    state.historyHidden = !state.historyHidden;
+    localStorage.setItem('fm_history_hidden', state.historyHidden ? '1' : '0');
+    renderRecordsStage();
+  };
+  const clrR = $('#rec-clear-recent');
+  if (clrR) clrR.onclick = () => clearRecentAdded();
+  const clrH = $('#rec-clear-history');
+  if (clrH) clrH.onclick = () => clearHistoryRecords();
 }
 
 function libFilterActive() {
@@ -1854,22 +2175,61 @@ function openLibSwitchModal() {
 }
 
 // ---------- 中间：全部文库总览（程序启动后的默认视图） ----------
-// 所有层级（全部文库 / 大类列表 / 组内组 / 组内文件 / 检索结果）每页数量统一
-const PAGE_SIZE = 12;
-// 分页条：四个层级共用同一段 HTML 与翻页逻辑，保证排版与文案一致
-function pagerHTML(page, pages) {
+// 卡片每页数量：随阅览区宽度 / 全屏状态动态调整（见 recomputePageSize）。
+// 初始 12；正常窗口约 3 行，最大化/全屏时列数增多、每页最多 60。
+let PAGE_SIZE = 12;
+const SEARCH_PAGE_SIZE = 20;   // 搜索结果每页条数
+const CHIP_PAGE_SIZE = 25;     // 标签 / 作者候选列表每页个数
+
+// 按阅览区实际宽度重算每页卡片数：约每 160px 一列（卡片 150 + 间距 10），
+// 普通视图 3 行、全屏 4 行，下限 12、上限 60。最大化 / 全屏后每页自动变多。
+function recomputePageSize() {
+  const panel = $('#preview-panel');
+  const fs = panel && panel.classList.contains('fs-fullscreen');
+  const w = (panel ? panel.clientWidth : 0) || window.innerWidth;
+  const cols = Math.max(2, Math.floor(w / 160));
+  const rows = fs ? 4 : 3;
+  PAGE_SIZE = Math.min(60, Math.max(12, cols * rows));
+}
+
+// 紧凑分页条：供标签 / 作者候选列表复用（每页 25 个）
+function chipPagerHTML(page, pages, prefix) {
   if (pages <= 1) return '';
-  return `<div class="pager">
-      <button id="pg-prev"${page <= 1 ? ' disabled' : ''}>上一页</button>
-      <span>第 ${page} / ${pages} 页</span>
-      <button id="pg-next"${page >= pages ? ' disabled' : ''}>下一页</button>
+  return `<div class="pager chip-pager">
+      <button type="button" id="${prefix}-prev"${page <= 1 ? ' disabled' : ''}>上一页</button>
+      <span>${page}/${pages}</span>
+      <button type="button" id="${prefix}-next"${page >= pages ? ' disabled' : ''}>下一页</button>
     </div>`;
 }
-function bindPager(body, rerender) {
-  const prev = body.querySelector('#pg-prev');
-  if (prev) prev.onclick = () => { state.libPageNum--; rerender(); };
-  const next = body.querySelector('#pg-next');
-  if (next) next.onclick = () => { state.libPageNum++; rerender(); };
+function bindChipPager(rootEl, prefix, getPage, setPage, rerender) {
+  const prev = rootEl.querySelector('#' + prefix + '-prev');
+  if (prev) prev.onclick = () => { setPage(getPage() - 1); rerender(); };
+  const next = rootEl.querySelector('#' + prefix + '-next');
+  if (next) next.onclick = () => { setPage(getPage() + 1); rerender(); };
+}
+
+// 分页条：四个层级共用同一段 HTML 与翻页逻辑，保证排版与文案一致。
+// ids/get/set 可选；不传则沿用文库层级默认的 pg-* 与 state.libPageNum。
+function pagerHTML(page, pages, ids) {
+  if (pages <= 1) return '';
+  const prevId = (ids && ids.prev) || 'pg-prev';
+  const nextId = (ids && ids.next) || 'pg-next';
+  return `<div class="pager">
+      <button id="${prevId}"${page <= 1 ? ' disabled' : ''}>上一页</button>
+      <span>第 ${page} / ${pages} 页</span>
+      <button id="${nextId}"${page >= pages ? ' disabled' : ''}>下一页</button>
+    </div>`;
+}
+function bindPager(body, rerender, opts) {
+  const o = opts || {};
+  const prevId = (o.ids && o.ids.prev) || 'pg-prev';
+  const nextId = (o.ids && o.ids.next) || 'pg-next';
+  const get = o.getPage || (() => state.libPageNum);
+  const set = o.setPage || ((v) => { state.libPageNum = v; });
+  const prev = body.querySelector('#' + prevId);
+  if (prev) prev.onclick = () => { set(get() - 1); rerender(); };
+  const next = body.querySelector('#' + nextId);
+  if (next) next.onclick = () => { set(get() + 1); rerender(); };
 }
 
 function showLibrariesView() {
@@ -2012,9 +2372,11 @@ function allAuthors() {
 }
 function renderTagChips() {
   const box = $('#lib-tag-chips');
+  // v0.4.3：旧标签 chips 容器已由搜索功能区的「按标签」附加条件取代，强制常隐，
+  // 避免旧 searchMode 命中时在没有勾选的情况下显示标签。
+  if (box) box.classList.add('hidden');
+  if (!box) return;
   const tags = allTags();
-  // 只有「按标签」检索模式时才展示标签区
-  box.classList.toggle('hidden', state.searchMode !== 'tag' || !tags.size);
   if (!tags.size) { box.innerHTML = ''; return; }
   let html = `<span class="tag-chip${!state.libTagFilter ? ' active' : ''}" data-tag="">全部</span>`;
   for (const [name, color] of tags)
@@ -2031,8 +2393,9 @@ function renderTagChips() {
 function renderAuthorChips() {
   const box = $('#lib-author-chips');
   if (!box) return;
+  // v0.4.3：旧作者 chips 容器已由搜索功能区的「按作者」附加条件取代，强制常隐。
+  box.classList.add('hidden');
   const authors = allAuthors();
-  box.classList.toggle('hidden', state.searchMode !== 'author' || !authors.length);
   if (!authors.length) { box.innerHTML = ''; return; }
   let html = `<span class="tag-chip${!state.libAuthorFilter ? ' active' : ''}" data-author="">全部</span>`;
   for (const name of authors)
@@ -2485,6 +2848,7 @@ $('#btn-add-to-group').onclick = async () => {
   if (r.error) { toast(r.error, true); return; }
   if (r.failed.length) toast(`${r.failed.length} 个失败：${r.failed[0].reason}`, true);
   else toast(`已移动 ${r.done.length} 个文件到「${g.displayName}」（原位置不再保留）`);
+  addRecentAdded(r.done, state.libData && state.libData.name);
   await loadLibrary();
   const ng = findGroup(state.libData, g.path);
   if (ng) {
@@ -2665,6 +3029,7 @@ function bindBatchEvents() {
     getNames: () => splitMetaList($('#ba-author') ? $('#ba-author').value : b.author),
     setNames: (ns) => { b.author = sortTagNames(ns).join('、'); renderBatchForm(); },
     onQuery: (q) => { b.authorQuery = q; },
+    getPage: () => b.authorPage, setPage: (v) => { b.authorPage = v; },
     onAfter: () => {}          // setNames 已整表重绘
   });
   bindTagBankSection({
@@ -2672,6 +3037,7 @@ function bindBatchEvents() {
     getNames: () => b.tags,
     setNames: (ns) => { b.tags = sortTagNames(ns); renderBatchForm(); },
     onQuery: (q) => { b.tbQuery = q; },
+    getPage: () => b.tbPage, setPage: (v) => { b.tbPage = v; },
     onAfter: () => {}          // setNames 已整表重绘，无需再画旧节点
   });
   if (b.focusTag) {
@@ -2723,6 +3089,7 @@ async function submitBatch() {
   okBtn.textContent = '开始添加';
   if (r.error) { toast(r.error, true); return true; }
   toast(`已移动 ${r.done} 个文件（原位置不再保留）${r.failed.length ? `，${r.failed.length} 个失败` : ''}${r.skipped ? `，跳过 ${r.skipped} 个` : ''}`);
+  addRecentAdded(r.added, r.root);
   const root = r.root, groupPath = r.groupPath;
   batchState = null;
   if (root !== state.libRoot) await selectLibrary(root);
@@ -2742,7 +3109,8 @@ async function openBatchAdd() {
   const fresh = {
     sources: [], locations: [], loc: null,
     groupName: '', catChoice: '', newCatName: '',
-    author: '', tags: [], busy: false, focusTag: false, tbQuery: '', authorQuery: ''
+    author: '', tags: [], busy: false, focusTag: false, tbQuery: '', authorQuery: '',
+    tbPage: 1, authorPage: 1
   };
   try { fresh.locations = await window.api.libLocations(); } catch { fresh.locations = []; }
   if (!fresh.locations.length) { toast('请先创建或选择一个可用的文库', true); return; }
@@ -2762,8 +3130,24 @@ const fsBtn = $('#btn-fullscreen');
 function setFullscreen(on) {
   previewPanel.classList.toggle('fs-fullscreen', on);
   fsBtn.textContent = on ? '退出全屏' : '全屏';
+  onViewportChanged();   // 全屏后重算每页卡片数并重绘
 }
 fsBtn.onclick = () => setFullscreen(!previewPanel.classList.contains('fs-fullscreen'));
+
+// 视口变化（窗口缩放 / 全屏 / 拖动分隔条）后：重算每页卡片数，必要时重绘网格。
+let _vpRaf = null;
+function onViewportChanged() {
+  recomputePageSize();
+  if (_vpRaf) cancelAnimationFrame(_vpRaf);
+  _vpRaf = requestAnimationFrame(() => {
+    if (state.section !== 'workbench' || state.libPreviewFile) return;
+    const mask = $('#modal-mask');
+    if (mask && !mask.classList.contains('hidden')) return;   // 弹窗打开时不重绘底层
+    if (!['libs', 'lib', 'cat', 'group', 'search'].includes(state.view)) return;
+    renderCurrentView();
+  });
+}
+window.addEventListener('resize', onViewportChanged);
 $('#btn-prev-file').onclick = () => stepPreview(-1);
 $('#btn-next-file').onclick = () => stepPreview(1);
 
@@ -2789,6 +3173,7 @@ function setupSplitter(handleId, panelId, side, storageKey) {
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
       localStorage.setItem(storageKey, parseInt(panel.getBoundingClientRect().width));
+      onViewportChanged();   // 分隔条宽度变化后重算每页卡片数
     };
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
@@ -2834,9 +3219,11 @@ document.addEventListener('keydown', (e) => {
     const collapsed = document.body.classList.toggle('nav-collapsed');
     navToggle.textContent = collapsed ? '▶' : '◀';
     navToggle.title = collapsed ? '展开功能选择区' : '隐藏功能选择区';
+    onViewportChanged();   // 侧栏折叠改变阅览区宽度
   });
   await loadLibList();
   // 启动首屏：中间区域直接显示全部文库
+  recomputePageSize();       // 按当前窗口宽度确定每页卡片数
   state.view = 'libs';
   showLibrariesView();
   // 每次启动都从「文库操作」开始，与旧版界面一致

@@ -137,17 +137,45 @@
     <!-- 搜索：全宽舞台，上方搜索控件、下方结果 -->
     <div id="stage-search" class="stage hidden">
       <div class="stage-body">
-        <!-- 搜索控件（上）：检索方式切换 + 关键词 + 分类 / 标签 / 作者 chips -->
+        <!-- 搜索控件（上）：范围=全部文库；名称框在最上，层级可多选，标签/作者作附加条件 -->
         <section id="search-controls" class="search-controls">
           <div class="sc-head">
-            <span class="sc-title">检索当前文库</span>
-            <button id="btn-search-mode" title="点击切换检索方式">按标签</button>
+            <span class="sc-title">🔍 检索全部文库</span>
+            <span class="sc-scope">先在下方输入名称，再用标签 / 作者缩小范围</span>
+            <button id="btn-search-mode" class="hidden" title="兼容旧版">按标签</button>
           </div>
+          <!-- 1. 按名称搜索（最上方） -->
           <div class="search-row">
-            <input id="search-input" type="text" placeholder="搜索文件名…" spellcheck="false">
+            <input id="search-input" type="text" placeholder="按名称搜索组 / 文件（留空则只按下方附加条件检索）…" spellcheck="false">
             <button id="btn-search" title="搜索">搜索</button>
           </div>
-          <div id="cat-chips"></div>
+          <!-- 2. 搜索层级（组 / 文件，可多选） -->
+          <div class="sc-levels">
+            <span class="sc-label">搜索层级</span>
+            <label><input type="checkbox" data-level="group" checked>组</label>
+            <label><input type="checkbox" data-level="file" checked>文件</label>
+          </div>
+          <!-- 3. 附加条件：标签 / 作者（勾选后展开） -->
+          <div class="sc-conds">
+            <label class="sc-cond"><input type="checkbox" id="cond-tag-on"> 按标签（附加条件）</label>
+            <div id="cond-tag-box" class="sc-cond-box hidden">
+              <div class="sc-cond-hint">点选已有标签作为需同时满足的条件；也可输入新标签后回车。</div>
+              <div id="cond-tag-selected" class="tag-chips"></div>
+              <input id="cond-tag-input" class="sc-cond-input" placeholder="输入标签名后回车添加…" spellcheck="false">
+              <div id="cond-tag-bank" class="sc-cond-bank"></div>
+              <div id="cond-tag-pager"></div>
+            </div>
+            <label class="sc-cond"><input type="checkbox" id="cond-author-on"> 按作者（附加条件）</label>
+            <div id="cond-author-box" class="sc-cond-box hidden">
+              <div class="sc-cond-hint">点选已有作者作为需同时满足的条件；也可输入新作者后回车。</div>
+              <div id="cond-author-selected" class="tag-chips"></div>
+              <input id="cond-author-input" class="sc-cond-input" placeholder="输入作者名后回车添加…" spellcheck="false">
+              <div id="cond-author-bank" class="sc-cond-bank"></div>
+              <div id="cond-author-pager"></div>
+            </div>
+          </div>
+          <!-- 兼容旧逻辑用的隐藏容器（不再可见） -->
+          <div id="cat-chips" class="hidden"></div>
           <div id="lib-tag-chips" class="tag-chips hidden"></div>
           <div id="lib-author-chips" class="tag-chips hidden"></div>
         </section>
