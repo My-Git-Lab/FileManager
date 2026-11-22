@@ -393,6 +393,29 @@ function isTextFile(name) {
   const ext = name.includes('.') ? name.split('.').pop().toLowerCase() : '';
   return TEXT_EXTS.has(ext);
 }
+
+// ---------- 缩略图（v0.4.6：图片 + 视频）----------
+// 卡片 HTML 里给图片/视频文件的 .t-slot 加 data-thumb=源路径；渲染后异步填充。
+// 缩略图由主进程按需生成并缓存，失败时保留原图标（降级）。
+let thumbSeq = 0;
+let thumbSuppress = false;   // 清除缓存后的那次重绘：只回退图标，不重新生成
+async function hydrateThumbs(body) {
+  if (thumbSuppress) return;
+  if (!body || !window.api || !window.api.thumbBatch) return;
+  const slots = Array.from(body.querySelectorAll('.t-slot[data-thumb]'));
+  if (!slots.length) return;
+  const mySeq = ++thumbSeq;
+  const srcs = slots.map(s => s.getAttribute('data-thumb'));
+  let map;
+  try { map = await window.api.thumbBatch(srcs); } catch { return; }
+  if (mySeq !== thumbSeq) return;   // 视图已切换，丢弃过期结果
+  slots.forEach(s => {
+    const tp = map && map[s.getAttribute('data-thumb')];
+    if (!tp || !s.isConnected) return;
+    s.classList.remove('with-icon');
+    s.innerHTML = `<img src="${fileUrl(tp)}" alt="">`;
+  });
+}
 function toast(msg, isError = false) {
   const t = $('#toast');
   t.textContent = msg;
@@ -2656,7 +2679,7 @@ function showLibFilterView() {
     </div>`;
     return `
     <div class="tile f-tile${selClass(x.file.path)}" data-i="${i}"${cardDataAttr('file', x.file.path, x.file.name)}>
-      <div class="t-slot with-icon"><span class="t-icon">${ICONS[x.file.category] || '📃'}</span></div>
+      <div class="t-slot with-icon"${(x.file.category === '图片' || x.file.category === '视频') ? ` data-thumb="${escapeHtml(x.file.path)}"` : ''}><span class="t-icon">${ICONS[x.file.category] || '📃'}</span></div>
       <div class="t-foot">
         <div class="t-name" title="${escapeHtml(x.file.name)}">${escapeHtml(x.file.name)}</div>
         <div class="t-size">${escapeHtml(x.group.displayName)} · ${fmtSize(x.file.size)}</div>
@@ -2669,6 +2692,7 @@ function showLibFilterView() {
     ? `<div class="grid-wrap"><div class="tile-grid">${tiles}</div>${pagerHTML(page, pages)}</div>`
     : `<div class="preview-placeholder"><div class="big">🔍</div><div>没有匹配的结果</div><div class="empty-sub">换个标签 / 作者，或调整关键词再试试</div></div>`;
 
+  hydrateThumbs(body);
   bindPager(body, showLibFilterView);
   refreshDetails();
   navCommit();
@@ -2695,7 +2719,7 @@ function showGroupPreview(g, cat) {
   const slice = g.files.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
   const tiles = slice.map((f, i) => `
     <div class="tile${selClass(f.path)}" data-i="${i}"${cardDataAttr('file', f.path, f.name)}>
-      <div class="t-slot with-icon"><span class="t-icon">${ICONS[f.category] || '📃'}</span></div>
+      <div class="t-slot with-icon"${(f.category === '图片' || f.category === '视频') ? ` data-thumb="${escapeHtml(f.path)}"` : ''}><span class="t-icon">${ICONS[f.category] || '📃'}</span></div>
       <div class="t-foot">
         <div class="t-name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</div>
         <div class="t-size">${fmtSize(f.size)}</div>
@@ -2703,6 +2727,7 @@ function showGroupPreview(g, cat) {
       ${OPS_HTML}
     </div>`).join('');
   body.innerHTML = `<div class="grid-wrap"><div class="tile-grid">${tiles}</div>${pagerHTML(page, pages)}</div>`;
+  hydrateThumbs(body);
   bindPager(body, () => showGroupPreview(g, cat));
   refreshDetails();
   navCommit();
@@ -3169,6 +3194,38 @@ async function openBatchAdd() {
   renderBatchForm();
 }
 $('#btn-batch-add').onclick = openBatchAdd;
+
+// ---------- 清除缩略图缓存（v0.4.5）：先弹窗展示各文库占用，确认后一键清除 ----------
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+$('#btn-clear-thumbs').onclick = async () => {
+  let s;
+  try { s = await window.api.thumbStats(); } catch { toast('读取缓存信息失败', true); return; }
+  const libs = (s && s.libs) || [];
+  const rows = libs.length
+    ? libs.map(l => `<div class="thumb-stat-row"><span>${escapeHtml(l.name)}</span><span>${fmtBytes(l.bytes)} · ${l.count} 张</span></div>`).join('')
+    : '<div class="hint">当前没有已登记的文库</div>';
+  const bodyHTML = `
+    <div class="thumb-stat-list">${rows}</div>
+    <div class="thumb-stat-total">合计：${fmtBytes(s ? s.totalBytes : 0)} · ${s ? s.totalCount : 0} 张</div>
+    <div class="hint" style="margin-top:10px">清除后再次浏览图片时会按需重新生成；原始文件不会受影响。</div>`;
+  showModal('清除缩略图缓存', bodyHTML, async () => {
+    try {
+      const r = await window.api.thumbClear();
+      toast(r && r.ok ? `已清除缩略图缓存（${r.removed} 个文件）` : '清除失败', !(r && r.ok));
+      // 已缓存的图片链接会失效：重绘当前视图让图片回退到图标，
+      // 但抑制这一次重绘的缩略图生成，避免「清完又立刻生成一批」。
+      if (r && r.ok) {
+        thumbSuppress = true;
+        try { renderCurrentView(); } finally { thumbSuppress = false; }
+      }
+    } catch { toast('清除失败', true); }
+  }, '确认清除');
+};
 
 // ---------- 批量添加（组）：每个文件/文件夹各建一个组，全部归入同一个大类 ----------
 // 与「批量添加（文件）」共用标签库 / 作者库 / 位置列表等控件，只是位置只到「大类」级、

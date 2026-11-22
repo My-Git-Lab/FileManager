@@ -39,5 +39,8 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.invoke('lib:setCover', { root, groupPath, cover }),
   libLocations: () => ipcRenderer.invoke('lib:locations'),
   libBatchAdd: (payload) => ipcRenderer.invoke('lib:batchAdd', payload),
-  libBatchAddGroups: (payload) => ipcRenderer.invoke('lib:batchAddGroups', payload)
+  libBatchAddGroups: (payload) => ipcRenderer.invoke('lib:batchAddGroups', payload),
+  thumbBatch: (srcs) => ipcRenderer.invoke('thumb:batch', srcs),
+  thumbStats: () => ipcRenderer.invoke('thumb:stats'),
+  thumbClear: () => ipcRenderer.invoke('thumb:clear')
 });

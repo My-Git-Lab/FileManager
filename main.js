@@ -1,8 +1,9 @@
-const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs').promises;
 const fss = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
 
 // ================= 中文输入法（IME）支持 =================
@@ -550,6 +551,221 @@ ipcMain.handle('sys:homeDirs', () => {
     music: gp('music'),
     videos: gp('videos')
   };
+});
+
+// ================= 缩略图（v0.4.6：图片 + 视频） =================
+// 长按缓存：每个文库根目录下 .thumbnails/（点开头，所有扫描器已自动跳过）。
+// 文件名 = 文件相对文库根路径的 sha256，源文件改动后按 mtime 自动重新生成。
+// 图片用 Electron 自带 nativeImage 缩放；视频用随程序附带的 ffmpeg 抽首帧。
+// 任何失败都返回 null，渲染层回退图标，绝不阻塞浏览。
+const THUMB_DIR = '.thumbnails';
+const THUMB_LIMIT = 200 * 1024 * 1024;   // 全局总上限 200MB
+const THUMB_EDGE = 200;                   // 缩略图短边宽度 px
+let thumbBytes = -1;                      // 缓存的字节统计，-1 表示未初始化
+let thumbLastEnforce = 0;
+
+// ffmpeg 可执行文件定位：
+//   打包后 → resources/ffmpeg/；开发时 → 项目 vendor/ffmpeg/；
+//   都没有 → 退回系统 PATH 里的 ffmpeg（execFile 按 PATH 查找）。
+// 找不到时抽帧会失败并降级回图标，不影响其它功能。
+function ffmpegBin() {
+  const exe = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+  const candidates = [];
+  if (app.isPackaged) {
+    candidates.push(path.join(process.resourcesPath, 'ffmpeg', exe));
+  } else {
+    candidates.push(path.join(__dirname, 'vendor', 'ffmpeg', exe));
+  }
+  for (const p of candidates) {
+    try { if (fss.existsSync(p)) return p; } catch {}
+  }
+  return exe;   // 交给 PATH 查找；找不到则 execFile 报错，走降级
+}
+
+// 用 ffmpeg 抽取视频首帧，输出 THUMB_EDGE 宽的 JPEG 到 out。
+// 先写临时文件再原子改名，避免失败时留下半截缓存。超时 20 秒。
+function videoFrameToJpeg(src, out) {
+  return new Promise((resolve) => {
+    const tmp = out + '.tmp-' + process.pid + '-' + Math.random().toString(36).slice(2) + '.jpg';
+    const args = [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-i', src,
+      '-frames:v', '1',
+      '-vf', 'scale=' + THUMB_EDGE + ':-2',
+      '-q:v', '5',
+      '-f', 'image2', tmp
+    ];
+    execFile(ffmpegBin(), args, { timeout: 20000, maxBuffer: 1024 * 1024 }, async (err) => {
+      const cleanup = () => { try { fss.unlinkSync(tmp); } catch {} };
+      if (err) { cleanup(); return resolve(false); }
+      try {
+        const st = await fs.stat(tmp);
+        if (!st.isFile() || st.size <= 0) { cleanup(); return resolve(false); }
+        try { await fs.unlink(out); } catch {}       // Windows 上覆盖前先删旧文件
+        await fs.rename(tmp, out);
+        return resolve(true);
+      } catch { cleanup(); return resolve(false); }
+    });
+  });
+}
+
+// 有限并发的批量映射（视频抽帧较重，限制同时 4 个，避免一页视频把 CPU 打满）
+async function mapLimit(items, limit, worker) {
+  const out = new Array(items.length);
+  let idx = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const i = idx++;
+      if (i >= items.length) break;
+      try { out[i] = await worker(items[i], i); } catch { out[i] = null; }
+    }
+  });
+  await Promise.all(runners);
+  return out;
+}
+
+// 找到 src 所属的已登记文库（用 realpath 比对，防符号链接绕过）
+function thumbOwnerLib(src) {
+  const real = canonicalPath(src);
+  if (!real) return null;
+  let libs = [];
+  try { libs = readRegistry().libraries || []; } catch {}
+  for (const lib of libs) {
+    const lr = canonicalPath(lib.path);
+    if (lr && withinRoot(lr, real)) return lib;
+  }
+  return null;
+}
+
+// 确保单张缩略图存在并返回其绝对路径；失败返回 null（渲染层据此回退图标）
+async function ensureThumb(src) {
+  if (!isAllowed(src)) return null;
+  const lib = thumbOwnerLib(src);
+  if (!lib) return null;                       // 只有已登记文库里的文件才生成缓存
+  const cat = categorize(path.extname(src));
+  if (cat !== '图片' && cat !== '视频') return null;
+  let st;
+  try { st = await fs.stat(src); } catch { return null; }
+  if (!st.isFile()) return null;
+  const libReal = canonicalPath(lib.path) || lib.path;
+  const srcReal = canonicalPath(src) || src;
+  const rel = relKey(libReal, srcReal);
+  const name = crypto.createHash('sha256').update(rel).digest('hex') + '.jpg';
+  const dir = path.join(lib.path, THUMB_DIR);
+  const out = path.join(dir, name);
+  // 复用：缓存存在、非空、且不早于源文件修改时间
+  try {
+    const ts = await fs.stat(out);
+    if (ts.isFile() && ts.size > 0 && ts.mtimeMs >= st.mtimeMs) return out;
+  } catch {}
+  let ok = false;
+  if (cat === '视频') {
+    // 视频：ffmpeg 抽首帧（内部已处理失败降级）
+    try { await fs.mkdir(dir, { recursive: true }); } catch { return null; }
+    ok = await videoFrameToJpeg(src, out);
+    return ok ? out : null;
+  }
+  // 图片：nativeImage 缩放编码；heic/tiff/损坏文件会返回空图或抛错，统一回退
+  let buf;
+  try {
+    const img = nativeImage.createFromPath(src);
+    if (img.isEmpty()) return null;
+    const small = img.resize({ width: THUMB_EDGE, quality: 'good' });
+    buf = small.toJPEG(75);
+    if (!buf || !buf.length) return null;
+  } catch { return null; }
+  try {
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(out, buf);
+    ok = true;
+  } catch { return null; }
+  return ok ? out : null;
+}
+
+// 扫描所有文库的缩略图占用（统计弹窗与超限清理共用）
+async function scanThumbTotals() {
+  let libs = [];
+  try { libs = readRegistry().libraries || []; } catch {}
+  const out = [];
+  let total = 0, count = 0;
+  for (const lib of libs) {
+    if (!isAllowed(lib.path)) continue;
+    const dir = path.join(lib.path, THUMB_DIR);
+    let bytes = 0, n = 0;
+    let names = [];
+    try { names = await fs.readdir(dir); } catch {}
+    for (const nm of names) {
+      try {
+        const st = await fs.stat(path.join(dir, nm));
+        if (st.isFile()) { bytes += st.size; n++; }
+      } catch {}
+    }
+    out.push({ name: lib.name || path.basename(lib.path), path: lib.path, bytes, count: n });
+    total += bytes; count += n;
+  }
+  thumbBytes = total;
+  return { libs: out, totalBytes: total, totalCount: count };
+}
+
+// 全局 200MB 上限：按缓存文件修改时间从旧到新淘汰，降到 90% 留余量。
+// 30 秒内只做一次全盘扫描，避免批量生成时反复 stat 所有文件。
+async function enforceThumbLimit(force) {
+  const now = Date.now();
+  if (!force && now - thumbLastEnforce < 30000) return;
+  thumbLastEnforce = now;
+  if (thumbBytes < 0) await scanThumbTotals();
+  if (thumbBytes <= THUMB_LIMIT) return;
+  let libs = [];
+  try { libs = readRegistry().libraries || []; } catch {}
+  const files = [];
+  for (const lib of libs) {
+    const dir = path.join(lib.path, THUMB_DIR);
+    let names = [];
+    try { names = await fs.readdir(dir); } catch {}
+    for (const nm of names) {
+      const fp = path.join(dir, nm);
+      try { const st = await fs.stat(fp); if (st.isFile()) files.push({ fp, mtime: st.mtimeMs, size: st.size }); } catch {}
+    }
+  }
+  files.sort((a, b) => a.mtime - b.mtime);
+  let bytes = files.reduce((s, f) => s + f.size, 0);
+  for (const f of files) {
+    if (bytes <= THUMB_LIMIT * 0.9) break;
+    try { await fs.unlink(f.fp); bytes -= f.size; } catch {}
+  }
+  thumbBytes = bytes;
+}
+
+// 批量取缩略图：返回 { [源文件绝对路径]: 缩略图绝对路径 | null }
+// 图片很快、视频抽帧较慢，用有限并发（4）兼顾速度与 CPU 占用
+ipcMain.handle('thumb:batch', async (e, srcs) => {
+  const out = {};
+  if (!Array.isArray(srcs)) return out;
+  const valid = srcs.filter(s => typeof s === 'string');
+  const results = await mapLimit(valid, 4, src => ensureThumb(src));
+  valid.forEach((src, i) => { out[src] = results[i]; });
+  await enforceThumbLimit(false);
+  return out;
+});
+
+// 统计各文库缓存大小（清除前的确认弹窗用）
+ipcMain.handle('thumb:stats', async () => scanThumbTotals());
+
+// 一键清除所有文库的缩略图缓存
+ipcMain.handle('thumb:clear', async () => {
+  let libs = [];
+  try { libs = readRegistry().libraries || []; } catch {}
+  let removed = 0;
+  for (const lib of libs) {
+    const dir = path.join(lib.path, THUMB_DIR);
+    try {
+      const names = await fs.readdir(dir);
+      removed += names.length;
+      await fs.rm(dir, { recursive: true, force: true });
+    } catch {}
+  }
+  thumbBytes = 0;
+  return { ok: true, removed };
 });
 
 // ---------- IPC: 选择目录 / 多选文件 ----------

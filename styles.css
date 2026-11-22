@@ -367,6 +367,15 @@ button { font-family: inherit; }
 /* 封面槽内的填充元素（马赛克 / 图标）撑满整槽 */
 .t-slot > .cat-mosaic { flex: 1 1 auto; align-self: stretch; }
 .t-slot.with-icon { background: linear-gradient(160deg, #f7f9fc, #eef2f8); }
+/* 图片缩略图（v0.4.5）：有 data-thumb 的槽由主进程异步填充 <img>，失败保留图标 */
+.t-slot[data-thumb] { background: var(--panel-2); }
+.t-slot[data-thumb] img { animation: thumb-fade .18s ease-in; }
+@keyframes thumb-fade { from { opacity: 0; } to { opacity: 1; } }
+/* 清除缓存弹窗的文库占用列表 */
+.thumb-stat-list { max-height: 260px; overflow-y: auto; }
+.thumb-stat-row { display: flex; justify-content: space-between; gap: 12px; padding: 7px 2px; border-bottom: 1px solid var(--border); font-size: var(--fs-base); }
+.thumb-stat-row span:last-child { color: var(--text-sub); flex: 0 0 auto; }
+.thumb-stat-total { margin-top: 12px; text-align: right; font-weight: var(--fw-strong); }
 /* ---- 卡片内文字：名称 + 副信息，四层一致 ---- */
 .tile .t-icon { font-size: 40px; line-height: 1; }
 .tile .t-name {
