@@ -46,6 +46,7 @@ const state = {
   libLibraries: [],             // 注册表中的所有文库（含统计信息）
   libSel: null,                 // { type: 'category'|'group', data }
   libExpanded: new Set(),       // 展开的大类名
+  libGroupsExpanded: new Set(), // 左栏「文库目录」中已展开显示全部组的大类（key = cat.path）
   libTagFilter: null,           // 标签筛选（标签名）
   libAuthorFilter: null,        // 作者筛选（作者名，仅组级结果）
   libSearch: '',                // 文库内搜索关键词
@@ -937,7 +938,7 @@ function renderCurrentView() {
   // 搜索功能区激活时只重绘自己的舞台，避免库内渲染覆盖跨库结果
   if (state.section === 'search') renderSearchStage();
 }
-// ---------- 左侧功能导航（仪表盘 / 文库操作 / 搜索 / 记录） ----------
+// ---------- 左侧功能导航（仪表盘 / 文库操作 / 搜索 / 最新添加） ----------
 // 同一时刻只显示一个功能区块：左侧只展开该区块的细分项，主体也只显示对应的舞台。
 // 现有所有按钮 id 都保留，只是按 data-section 归属到不同区块。
 const SECTION_STAGES = {
@@ -1186,15 +1187,31 @@ function renderSearchStage() {
       : '在上方调整条件后再试（标签 / 作者为需同时满足的附加条件）';
     rows = '<div class="stage-empty"><div class="big">🔍</div><div>没有匹配的结果</div><div class="empty-sub">' + hint + '</div></div>';
   } else {
-    rows = `<div class="search-results">` + pageList.map(x => {
+    rows = `<div class="tile-grid result-grid">` + pageList.map(x => {
       // 跨库结果项：{kind,name,path,icon,sub,libName}；旧库内文件项：{file,group}
+      // 仅改显示样式：列表行改为卡片，保留 data-path / data-kind 供原有双击逻辑使用
       const isFlat = x && x.name !== undefined && x.file === undefined;
       const name = isFlat ? x.name : (x.file && x.file.name) || '';
       const sub = isFlat ? escapeHtml(x.sub || '') : (x.group ? escapeHtml(x.group.displayName) + ' · ' + fmtSize(x.file.size) : '');
-      const icon = isFlat ? (x.icon || (x.kind === 'group' ? '🗂' : '📃')) : (ICONS[x.file.category] || '📃');
-      const level = isFlat ? `<span class="res-level">${x.kind === 'group' ? '组' : '文件'}</span>` : '';
-      const dp = x.path ? ` data-path="${escapeHtml(x.path)}" data-kind="${escapeHtml(x.kind || (isFlat ? '' : 'file'))}"` : '';
-      return `<div class="res-row"${dp}><span class="res-ico">${icon}</span><span class="res-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>${level}<span class="res-sub">${sub}</span></div>`;
+      const kind = x.kind || (isFlat ? '' : 'file');
+      const filePath = x.path || (x.file && x.file.path) || '';
+      const cat = isFlat ? (x.category || catOfPath(filePath)) : ((x.file && x.file.category) || '');
+      const icon = isFlat
+        ? (cat ? (ICONS[cat] || '📃') : (x.icon || (kind === 'group' ? '🗂' : '📃')))
+        : (ICONS[cat] || '📃');
+      const level = (kind === 'group' || kind === 'file')
+        ? `<span class="tile-level">${kind === 'group' ? '组' : '文件'}</span>` : '';
+      const dp = x.path ? ` data-path="${escapeHtml(x.path)}" data-kind="${escapeHtml(kind)}"` : '';
+      // 图片/视频文件卡片复用既有缩略图方式：data-thumb + hydrateThumbs
+      const thumb = (kind === 'file' && (cat === '图片' || cat === '视频') && filePath)
+        ? ` data-thumb="${escapeHtml(filePath)}"` : '';
+      return `<div class="tile result-tile"${dp}>
+        <div class="t-slot with-icon"${thumb}><span class="t-icon">${icon}</span>${level}</div>
+        <div class="t-foot">
+          <div class="t-name" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
+          <div class="t-size">${sub}</div>
+        </div>
+      </div>`;
     }).join('') + `</div>`;
   }
   box.innerHTML = `
@@ -1202,6 +1219,7 @@ function renderSearchStage() {
     <div class="stage-toolbar"><span class="stage-chip active">跨文库</span><span class="stage-chip">组 / 文件</span><span class="toolbar-cond">${cond || '未设置筛选条件'}</span></div>
     ${rows}
     ${pagerHTML(page, pages, { prev: 'spg-prev', next: 'spg-next' })}`;
+  hydrateThumbs(box);   // 图片/视频结果卡片填充缩略图（失败自动回退图标）
   bindPager(box, renderSearchStage, {
     ids: { prev: 'spg-prev', next: 'spg-next' },
     getPage: () => state.searchPageNum,
@@ -1212,26 +1230,33 @@ function renderSearchStage() {
     el.title = (isGroup ? '双击打开组文件夹：' : '双击打开：') + el.dataset.path;
     el.ondblclick = () => {
       if (isGroup) { window.api.showInFolder(el.dataset.path); return; }
-      openEntry({ path: el.dataset.path, name: el.querySelector('.res-name')?.textContent || '', isDir: false });
+      openEntry({ path: el.dataset.path, name: el.querySelector('.t-name')?.textContent || '', isDir: false });
     };
   });
 }
 
-// 记录（全宽上下布局）：上「最近添加」、下「打开历史」，各最多 10 条，各自可隐藏 / 清空
-function recordRowsHTML(items, attr) {
+// 最新添加（全宽单面板）：仅「最近添加」，最多 10 条，可隐藏 / 清空
+// 仅改显示样式：记录行改为卡片网格，保留 data-recent 供原有点击打开逻辑使用
+function recordCardsHTML(items, attr) {
   if (!items.length) return '<div class="list-empty" style="padding:10px">暂无记录</div>';
-  return `<div class="records-list">` + items.map(h =>
-    `<div class="res-row" ${attr}="${escapeHtml(h.path)}"><span class="res-ico">${ICONS[h.category] || '📃'}</span>
-      <span class="res-name" title="${escapeHtml(h.path)}">${escapeHtml(h.name)}</span>
-      <span class="res-sub">${escapeHtml(h.libName ? h.libName + ' · ' : '')}${escapeHtml(h.path)}</span></div>`).join('') + `</div>`;
+  return `<div class="tile-grid result-grid">` + items.map(h => {
+    const thumb = (h.category === '图片' || h.category === '视频')
+      ? ` data-thumb="${escapeHtml(h.path)}"` : '';
+    return `<div class="tile result-tile" ${attr}="${escapeHtml(h.path)}">
+      <div class="t-slot with-icon"${thumb}><span class="t-icon">${ICONS[h.category] || '📃'}</span></div>
+      <div class="t-foot">
+        <div class="t-name" title="${escapeHtml(h.path)}">${escapeHtml(h.name)}</div>
+        <div class="t-size">${escapeHtml(h.libName ? h.libName + ' · ' : '')}${escapeHtml(h.path)}</div>
+      </div>
+    </div>`;
+  }).join('') + `</div>`;
 }
 function renderRecordsStage() {
   const box = $('#records-stage-body');
   if (!box) return;
   const recent = state.recentAdded.slice(0, 10);
-  const hist = state.openHistory.slice(0, 10);
   box.innerHTML = `
-    <div class="stage-title"><span>🕘 记录</span><span class="stage-sub">最近添加与打开历史，各保留最近 10 条</span></div>
+    <div class="stage-title"><span>📥 最新添加</span><span class="stage-sub">最近添加的文件，保留最近 10 条</span></div>
     <div class="stage-panel rec-panel">
       <div class="panel-title rec-title">
         <span>📥 最近添加 <span class="rec-count">${state.recentAdded.length} / 10</span></span>
@@ -1241,53 +1266,27 @@ function renderRecordsStage() {
         </span>
       </div>
       <div id="rec-recent-body" class="rec-body${state.recentHidden ? ' hidden' : ''}">
-        ${recent.length ? recordRowsHTML(recent, 'data-recent')
+        ${recent.length ? recordCardsHTML(recent, 'data-recent')
           : '<div class="stage-empty"><div class="big">📥</div><div>暂无最近添加</div><div class="empty-sub">通过「添加文件 / 批量添加」导入的文件会出现在这里</div></div>'}
       </div>
-    </div>
-    <div class="stage-panel rec-panel" style="margin-top:14px">
-      <div class="panel-title rec-title">
-        <span>🕘 打开历史 <span class="rec-count">${state.openHistory.length} / 10</span></span>
-        <span class="rec-acts">
-          <button id="rec-toggle-history" class="stage-act">${state.historyHidden ? '展开' : '隐藏'}</button>
-          <button id="rec-clear-history" class="stage-act">清空</button>
-        </span>
-      </div>
-      <div id="rec-history-body" class="rec-body${state.historyHidden ? ' hidden' : ''}">
-        ${hist.length ? recordRowsHTML(hist, 'data-rec')
-          : '<div class="stage-empty"><div class="big">🕘</div><div>暂无打开历史</div><div class="empty-sub">用系统程序打开过的文件会出现在这里</div></div>'}
-      </div>
     </div>`;
-  // 点击记录：打开文件
+  hydrateThumbs(box);   // 图片/视频记录卡片填充缩略图（失败自动回退图标）
+  // 点击记录：打开文件（逻辑不变）
   box.querySelectorAll('[data-recent]').forEach(el => {
     el.onclick = () => {
       const h = state.recentAdded.find(x => x.path === el.dataset.recent);
       if (h) openEntry({ path: h.path, name: h.name, isDir: false, category: h.category });
     };
   });
-  box.querySelectorAll('[data-rec]').forEach(el => {
-    el.onclick = () => {
-      const h = state.openHistory.find(x => x.path === el.dataset.rec);
-      if (h) openEntry({ path: h.path, name: h.name, isDir: false, category: h.category });
-    };
-  });
-  // 隐藏 / 清空
+  // 隐藏 / 清空（逻辑不变）
   const tglR = $('#rec-toggle-recent');
   if (tglR) tglR.onclick = () => {
     state.recentHidden = !state.recentHidden;
     localStorage.setItem('fm_recent_hidden', state.recentHidden ? '1' : '0');
     renderRecordsStage();
   };
-  const tglH = $('#rec-toggle-history');
-  if (tglH) tglH.onclick = () => {
-    state.historyHidden = !state.historyHidden;
-    localStorage.setItem('fm_history_hidden', state.historyHidden ? '1' : '0');
-    renderRecordsStage();
-  };
   const clrR = $('#rec-clear-recent');
   if (clrR) clrR.onclick = () => clearRecentAdded();
-  const clrH = $('#rec-clear-history');
-  if (clrH) clrH.onclick = () => clearHistoryRecords();
 }
 
 function libFilterActive() {
@@ -2536,7 +2535,12 @@ function renderLibTree() {
       if (!shown.length) {
         wrap.innerHTML = '<div class="list-empty" style="padding:6px 8px 6px 26px">暂无符合条件的组</div>';
       }
-      for (const g of shown) {
+      // 组数过多时默认只显示前 10 个，点「展开」显示全部、可再收起
+      const TREE_GROUP_LIMIT = 10;
+      const allOpen = state.libGroupsExpanded.has(cat.path);
+      const truncated = shown.length > TREE_GROUP_LIMIT && !allOpen;
+      const visible = truncated ? shown.slice(0, TREE_GROUP_LIMIT) : shown;
+      for (const g of visible) {
         const row = document.createElement('div');
         row.className = 'group-row' + (state.libSel?.type === 'group' && state.libSel.data.path === g.path ? ' selected' : '');
         const dots = [...(g.tags || [])].sort((a, b) => tagCompare(a.name, b.name)).map(t => `<i class="tag-dot" style="background:${safeTagColor(t.color, t.name)}" title="${escapeHtml(t.name)}"></i>`).join('');
@@ -2546,6 +2550,19 @@ function renderLibTree() {
           <span class="g-meta">${g.fileCount} 文件 · ${fmtSize(g.totalSize)}</span>`;
         row.onclick = () => gotoGroup(g);
         wrap.appendChild(row);
+      }
+      if (shown.length > TREE_GROUP_LIMIT) {
+        const more = document.createElement('div');
+        more.className = 'group-more';
+        more.textContent = allOpen
+          ? '收起'
+          : `展开剩余 ${shown.length - TREE_GROUP_LIMIT} 个组`;
+        more.onclick = () => {
+          if (allOpen) state.libGroupsExpanded.delete(cat.path);
+          else state.libGroupsExpanded.add(cat.path);
+          renderLibTree();
+        };
+        wrap.appendChild(more);
       }
       box.appendChild(wrap);
     }

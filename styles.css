@@ -264,6 +264,16 @@ button { font-family: inherit; }
   white-space: nowrap;
 }
 .group-row .g-meta { font-size: var(--fs-xs); color: var(--text-sub); flex: 0 0 auto; }
+.group-more {
+  margin: 2px 8px 2px 26px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: var(--fs-xs);
+  color: var(--accent);
+  cursor: pointer;
+  user-select: none;
+}
+.group-more:hover { background: var(--hover); }
 
 /* ========== 卡片网格：四个层级（文库 / 大类 / 组 / 文件）共用同一套尺寸 ========== */
 .tile-grid {
@@ -1304,6 +1314,15 @@ body.nav-collapsed #nav-toggle {
 .res-sub { margin-left: auto; color: var(--text-sub); font-size: var(--fs-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .records-list .res-row { cursor: pointer; }
 .records-list .res-row:hover { background: var(--hover); }
+
+/* 搜索结果 / 最新添加：卡片网格（仅显示样式，沿用 .tile 基础外观） */
+.result-grid {
+  --tile-col: 170px;
+  --tile-cover-h: 96px;
+  gap: 12px;
+  padding: 2px;
+}
+.result-tile .t-icon { font-size: 36px; }
 
 /* 「记录」区块时让左侧历史列表占满可用高度 */
 body[data-section="records"] #history-box { flex: 1 1 auto; max-height: none; }

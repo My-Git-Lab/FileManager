@@ -2112,8 +2112,9 @@ ipcMain.handle('lib:batchAddGroups', async (e, payload) => {
   for (const it of items) {
     // 源在目标文库内部 → 跳过，避免把已归档内容再搬一次
     if (inside(it.src)) { skipped++; continue; }
-    // 组名与来源同名：文件用完整文件名（含扩展名），文件夹用文件夹名
-    const display = path.basename(it.src);
+    // 组名与来源同名：文件用不含扩展名的文件名，文件夹用文件夹名
+    const base = path.basename(it.src);
+    const display = it.kind === 'file' ? path.basename(base, path.extname(base)) : base;
     const created = await createGroupFolder(root, categoryName, display);
     if (created.error) { failed.push({ src: it.src, reason: created.error }); continue; }
     const groupPath = created.path;
